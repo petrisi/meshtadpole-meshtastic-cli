@@ -60,7 +60,8 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 | Requests: telemetry, position, traceroute, neighborinfo | working |
 | ACK/NAK of packets to us; NodeInfo and traceroute responders; NO_RESPONSE for others | working |
 | Bulk admin targets (lists, @groups), ignore/unignore | working |
-| Daemon: start without stick, reconnect, RX watchdog | implemented; unplug test pending |
+| Daemon: start without stick, reconnect, RX watchdog | working (unplug/replug tested on Windows) |
+| Fire-and-forget admin writes (`--no-wait`), passkey cache | working |
 | AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
 | Linux | untested |
 

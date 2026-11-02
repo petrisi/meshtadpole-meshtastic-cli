@@ -130,6 +130,16 @@ fn handle_client(stream: TcpStream, sh: Arc<Shared>) -> Result<()> {
                 }
                 writeln!(w, "{out}")?;
             }
+            Some("passkey") => {
+                // Cached admin session passkey, if received < 140 s ago. Firmware reuses a key for 150 s after issue and it is valid 300 s after issue, so a received key is guaranteed valid only 150 s after receipt.
+                let to = req["to"].as_u64().unwrap_or(0) as u32;
+                let pk = sh.passkeys.lock().unwrap().get(&to).cloned();
+                let v = match pk {
+                    Some((k, t)) if store::now() - t < 140.0 => json!({"passkey": k, "age_s": store::now() - t}),
+                    _ => json!({"passkey": null}),
+                };
+                writeln!(w, "{v}")?;
+            }
             Some("admin_set") => {
                 let out = match admin_set(&sh, &req) {
                     Ok(v) => v,

@@ -44,7 +44,7 @@ Admin TARGETS: one node id, comma-separated ids, or `@group` (config `groups`, e
 
 `--since S` is seconds before now.
 
-Wait options for `send`, `nodeinfo`, `admin`: `--wait S` (per transmission, default 60), `--retries N` (retransmissions of the same packet id if nothing heard, default 1), `--hop-limit N`.
+Wait options for `send`, `nodeinfo`, `request`, `admin`: `--wait S` (per transmission, default 60), `--retries N` (retransmissions of the same packet id if nothing heard, default 1), `--hop-limit N` (default `node.hop_limit`), `--no-wait` (admin writes only: transmit once, return immediately; `ok` = transmitted).
 
 ## Admin items
 
@@ -74,6 +74,10 @@ Firmware (2.7.26) effect on the target: packets from NODE are dropped in `Router
 The ignore state is not readable over the air. Verification options: NODE's packets stop carrying the target's `relay_node` byte in `rx_frames` (rebroadcasting roles only); or a request originated as NODE gets no reply.
 
 Verified on !3948c983 with fictitious node !00000002: traceroute reply before ignore, none after (×2), reply again after unignore.
+
+Fire-and-forget: `admin <TARGETS> ignore <NODE> --no-wait`. Every admin write needs a session passkey, so the first write to a target costs one round trip (get → passkey; our ACK of the reply; the write). With a cached passkey the write is a single packet. Measured on !3948c983 (hop limit 1): no cached passkey: 3 packets, 4.3 s; cached: 1 packet, 0.6 s. No delivery or acceptance feedback.
+
+Passkey cache: daemon keeps the last passkey per node from admin responses; reused if received < 140 s ago (firmware 2.7.26 `setPassKey`: key reused for 150 s after issue, valid 300 s after issue; another admin client reading after 150 s rotates it). Stale key → write rejected (`ADMIN_BAD_SESSION_KEY`, only visible without `--no-wait`).
 
 ## Admin writes
 
@@ -204,5 +208,6 @@ TCP `config.api` (default `127.0.0.1:47403`), one JSON object per line.
 | `{"cmd":"subscribe"}` | `{"subscribed":true}` then frame events until disconnect |
 | `{"cmd":"send","to":N,"port":"NAME","payload_b64":"..","want_ack":b,"want_response":b,"pkc":b\|null,"channel":i,"hop_limit":n\|null,"wait_s":f,"retries":n,"from":n\|null}` | send result. `from`: testing aid, originate as another node number (channel encryption only) |
 | `{"cmd":"admin_set",...}` | admin write result (see Admin writes) |
+| `{"cmd":"passkey","to":N}` | `{"passkey":"..","age_s":f}` or `{"passkey":null}` (cached admin session passkey, < 140 s) |
 
 One daemon per stick; a second daemon fails to bind the API port.

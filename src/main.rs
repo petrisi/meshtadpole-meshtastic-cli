@@ -153,6 +153,10 @@ struct WaitOpts {
     /// Override hop limit.
     #[arg(long, global = true)]
     hop_limit: Option<u8>,
+    /// Admin writes (raw, ignore, unignore): transmit once and return; no ACK/NAK wait, no retransmission.
+    /// A session passkey is still required: cached (<140 s) or fetched with one round trip.
+    #[arg(long, global = true)]
+    no_wait: bool,
 }
 
 #[derive(Subcommand)]
@@ -308,6 +312,13 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
                 };
                 let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
                 if !is_get && msg.get("session_passkey").is_none() {
+                    if let Ok(c) = daemon::call(&cfg.api, &json!({"cmd": "passkey", "to": to})) {
+                        if let Some(pk) = c["passkey"].as_str() {
+                            msg["session_passkey"] = json!(pk);
+                        }
+                    }
+                }
+                if !is_get && msg.get("session_passkey").is_none() {
                     let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
                     let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
                     let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
@@ -344,12 +355,20 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
             // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
             let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
             let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
-            let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w);
+            let fire = w.no_wait && !is_get;
+            let r = if fire {
+                let wf = WaitOpts { wait: 0.0, retries: 0, ..*w };
+                daemon::call(&cfg.api, &send_req(to, "ADMIN_APP", &payload, false, false, Some(true), 0, wf))
+            } else {
+                pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w)
+            };
             let entry = match r {
                 Ok(r) => {
                     let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
                     // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
-                    let ok = if is_get {
+                    let ok = if fire {
+                        r["transmissions"].as_array().is_some_and(|a| !a.is_empty())
+                    } else if is_get {
                         resp.is_some()
                     } else if ack_only {
                         r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
@@ -357,7 +376,7 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
                         r["nak"].is_null()
                     };
                     json!({
-                        "item": label, "ok": ok, "acked": r["acked"], "response": resp, "nak": r["nak"],
+                        "item": label, "ok": ok, "fire_and_forget": fire, "acked": r["acked"], "response": resp, "nak": r["nak"],
                         "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
                         "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
                         "key_exchange": r.get("key_exchange"),
