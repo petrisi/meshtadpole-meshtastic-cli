@@ -48,6 +48,25 @@ impl Decoded {
     }
 }
 
+/// Field names whose values are replaced with `<redacted>` in decoded output and storage.
+pub const SECRET_FIELDS: &[&str] = &["private_key"];
+
+pub fn redact(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if SECRET_FIELDS.contains(&k.as_str()) && !x.is_null() {
+                    *x = Value::String("<redacted>".into());
+                } else {
+                    redact(x);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(redact),
+        _ => {}
+    }
+}
+
 /// Decode `meshtastic.Data` bytes into JSON with the payload expanded per portnum.
 pub fn data_json(plain: &[u8]) -> anyhow::Result<(i32, Value)> {
     let mut v = proto::decode_json("Data", plain)?;
@@ -67,7 +86,8 @@ pub fn data_json(plain: &[u8]) -> anyhow::Result<(i32, Value)> {
             obj.insert("payload".into(), Value::String(String::from_utf8_lossy(&payload).into_owned()));
         }
         PayloadKind::Message(m) => match proto::decode_json(m, &payload) {
-            Ok(p) => {
+            Ok(mut p) => {
+                redact(&mut p);
                 obj.insert("payload".into(), p);
                 obj.insert("payload_type".into(), Value::String(m.into()));
             }

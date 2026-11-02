@@ -1,6 +1,6 @@
 # Database schema
 
-SQLite, WAL mode. `meta.schema_version` = 1. Full DDL: `tadpole-mt schema`. Times are Unix seconds (REAL, host clock). Node numbers are unsigned 32-bit stored as INTEGER.
+SQLite, WAL mode. `meta.schema_version` = 2. Full DDL: `tadpole-mt schema`. Times are Unix seconds (REAL, host clock). Node numbers are unsigned 32-bit stored as INTEGER.
 
 ## sessions
 
@@ -37,7 +37,7 @@ Status semantics:
 - `crc_error`: header fields may be garbage; node table not updated.
 - `header_error`: LoRa header failed; only rx_time and instantaneous rssi stored.
 - `no_channel`: channel hash matches no configured channel.
-- `pkc`: hash 0, unicast — public-key encrypted DM/admin; undecryptable without our key.
+- `pkc`: hash 0, unicast, not to/from us (or peer key unknown) — public-key encrypted; not decryptable. PKC frames to/from us decode with `channel` = `PKC`.
 - `decode_error`: hash matched but decrypted bytes are not a valid `Data` (hash collision or wrong PSK).
 
 ## nodes
@@ -64,6 +64,25 @@ One row per 60 s of daemon operation.
 | noise_min/avg/max, noise_samples | instantaneous RSSI sampled ~1/s while idle (dBm). Includes in-progress traffic; `noise_min` is the best floor estimate |
 | frames, crc_errors, header_errors | counts in interval |
 | rx_airtime_ms | sum of airtime of received frames (local channel occupancy) |
+
+## tx_frames
+
+Every transmission by this node (including retransmissions).
+
+| Column | Meaning |
+|---|---|
+| tx_time, raw, len, airtime_ms | |
+| pkt_to, pkt_id, hop_limit, want_ack, channel_hash | header |
+| encryption | `pkc` or `channel` |
+| portnum, port, data_json | plaintext `Data` as sent |
+| attempt | 0 = first transmission |
+| error | radio error, NULL on success |
+
+Our packets heard back via relays appear in `rx_frames` with `pkt_from` = our node num.
+
+## requests
+
+One row per daemon `send` API call: `request_json` (as received), `result_json` (send result incl. acks, responses, relays). Secrets in decoded payloads are redacted.
 
 ## Views
 

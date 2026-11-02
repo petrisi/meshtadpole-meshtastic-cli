@@ -47,6 +47,13 @@ pub struct NodeConfig {
     pub hop_limit: u8,
     /// Max fraction of airtime we may transmit over a rolling hour (EU868 sub-band: 0.10).
     pub duty_cycle_limit: f64,
+    /// Enforce `duty_cycle_limit`. Disable only in lab conditions (shielded/dummy load).
+    #[serde(default = "yes")]
+    pub duty_cycle_enforce: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for NodeConfig {
@@ -60,6 +67,7 @@ impl Default for NodeConfig {
             private_key: None,
             hop_limit: 3,
             duty_cycle_limit: 0.10,
+            duty_cycle_enforce: true,
         }
     }
 }

@@ -19,7 +19,12 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 | Command | Needs | Output |
 |---|---|---|
 | `devices` | — | array: bus, address, vid, pid, product, serial, device_id, open_error |
-| `config [--write]` | — | effective config, derived LoRa parameters (freq_hz, bw_hz, sf, cr, sync_word, ldro, channel hashes), paths |
+| `config [--write] [--set PATH=VALUE]...` | — | effective config (private key redacted), derived LoRa parameters (freq_hz, bw_hz, sf, cr, sync_word, ldro, channel hashes), paths. `--set` writes the file; value parsed as JSON else string; `node.num` accepts node ids. Restart daemon to apply |
+| `identity` | — | our node num/id, names, role, public key derived from `node.private_key` |
+| `send <TO> <TEXT> [--channel N] [--no-pkc] [--no-ack]` | daemon | send result (below). Unicast uses PKC when the destination key is known |
+| `nodeinfo <TO>` | daemon | send our User (incl. public key) over the channel with want_response |
+| `admin <NODE> get <ITEM>...` | daemon | `{node, results[]}`; one admin request per item. Progress lines on stderr |
+| `admin <NODE> raw '<JSON>'` | daemon | arbitrary `meshtastic.AdminMessage` as proto3 JSON |
 | `daemon` | radio | foreground; lifecycle events as NDJSON on stderr. Stops on Ctrl+C |
 | `status` | daemon | pid, session_id, usb_serial, radio parameters, frames received |
 | `listen [--ok-only] [--seconds N]` | daemon | NDJSON frame events (below) |
@@ -33,6 +38,43 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 Node IDs: `!xxxxxxxx`, `xxxxxxxx`, `0xxxxxxxxx`, decimal, `^all` (broadcast).
 
 `--since S` is seconds before now.
+
+Wait options for `send`, `nodeinfo`, `admin`: `--wait S` (per transmission, default 60), `--retries N` (retransmissions of the same packet id if nothing heard, default 1), `--hop-limit N`.
+
+## Admin items
+
+`owner`, `metadata`, `channel:<0-7>`, `config:<name>`, `module:<name>`; groups `channels`, `configs`, `modules`, `all`.
+
+Config names: device position power network display lora bluetooth security sessionkey deviceui.
+Module names: mqtt serial extnotif storeforward rangetest telemetry cannedmsg audio remotehardware neighborinfo ambientlighting detectionsensor paxcounter statusmessage trafficmanagement tak meshbeacon.
+
+Admin requests are PKC-encrypted with `node.private_key`; the target must list our public key in `security.admin_key`. On NAK `PKI_UNKNOWN_PUBKEY` the CLI sends our NodeInfo and retries once (`key_exchange` in result). Firmware 2.7.26 required this.
+
+Responses include `session_passkey`; set operations must echo it within 300 s (not yet exposed).
+
+`private_key` fields in decoded payloads (e.g. `get_config_response.security`) are replaced with `<redacted>` in output and storage. Firmware returns the node private key to authorized admins.
+
+## Send result
+
+```json
+{"packet_id":3447972213,"to":"!59a5f896","port":"TEXT_MESSAGE_APP","encryption":"pkc",
+ "transmissions":[{"tx_frame_id":1,"tx_time":...,"attempt":0,"len":36,"airtime_ms":443.4}],
+ "acked":true,"nak":null,"acks":[<frame event>],"responses":[<frame event>],
+ "relays_heard":[{"relay_node":212,"hop_limit":2,"rssi":-30,"snr":11.25,"rx_time":...,"frame_id":...}],
+ "complete":true}
+```
+
+- `acks`: ROUTING_APP frames with `request_id` = packet_id. `nak` = `error_reason` if not NONE.
+- `responses`: first non-Routing frame with `request_id` = packet_id.
+- `relays_heard`: our packet heard rebroadcast (implicit ACK, relay coverage).
+- Broadcasts complete after `--wait`.
+
+## Transmit policy
+
+- CSMA: TX deferred while a preamble/header is being received; random 0–400 ms initial backoff.
+- Duty cycle: TX refused when own airtime in the last hour would exceed `node.duty_cycle_limit` (default 0.10). Disable for lab use: `config --set node.duty_cycle_enforce=false`.
+- Power: `radio.tx_power_dbm` (default 14, max 22).
+- This node never rebroadcasts. `node.role` is only advertised.
 
 ## Frame event (listen)
 
@@ -59,5 +101,6 @@ TCP `config.api` (default `127.0.0.1:47403`), one JSON object per line.
 |---|---|
 | `{"cmd":"status"}` | one status object |
 | `{"cmd":"subscribe"}` | `{"subscribed":true}` then frame events until disconnect |
+| `{"cmd":"send","to":N,"port":"NAME","payload_b64":"..","want_ack":b,"want_response":b,"pkc":b\|null,"channel":i,"hop_limit":n\|null,"wait_s":f,"retries":n}` | send result |
 
 One daemon per stick; a second daemon fails to bind the API port.

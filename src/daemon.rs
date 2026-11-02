@@ -105,6 +105,8 @@ fn handle_client(stream: TcpStream, sh: Arc<Shared>) -> Result<()> {
                 let mut s = sh.status.lock().unwrap().clone();
                 s["frames"] = json!(sh.frames.load(Ordering::Relaxed));
                 s["tx_airtime_last_hour_ms"] = json!(sh.airtime_last_hour_ms());
+                s["duty_cycle_limit"] = json!(sh.cfg.node.duty_cycle_limit);
+                s["duty_cycle_enforce"] = json!(sh.cfg.node.duty_cycle_enforce);
                 writeln!(w, "{s}")?;
             }
             Some("subscribe") => {
@@ -401,7 +403,7 @@ fn transmit(radio: &mut sx1262::Sx1262, lora: &sx1262::LoraConfig, sh: &Shared, 
     let airtime = lora.time_on_air_us(o.frame.len()) / 1000.0;
     let budget = sh.cfg.node.duty_cycle_limit * 3_600_000.0;
     let used = sh.airtime_last_hour_ms();
-    if used + airtime > budget {
+    if sh.cfg.node.duty_cycle_enforce && used + airtime > budget {
         bail!("duty cycle limit: {used:.0} ms used of {budget:.0} ms in last hour");
     }
     let t = store::now();

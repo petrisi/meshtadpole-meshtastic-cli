@@ -53,10 +53,17 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 |---|---|
 | RX, decrypt (channel AES-CTR), decode, store | working |
 | Duplicate/rebroadcast tracking, node summary, radio noise stats | working |
-| PKC decrypt (DMs to us), AEAD channels | not implemented |
-| TX, requests (telemetry/position/traceroute/nodeinfo), routing participation | not implemented |
-| Remote admin (PKC admin key) | not implemented |
+| PKC encrypt/decrypt (DMs, admin to/from us) | working |
+| TX: text (channel/PKC), NodeInfo exchange, CSMA, duty-cycle guard | working |
+| Remote admin read (owner, metadata, channels, configs, modules) | working (2.7.26) |
+| Remote admin set (session passkey) | not implemented |
+| Requests: telemetry, position, traceroute, neighborinfo | not implemented |
+| AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
 | Linux | untested |
+
+## Node identity
+
+`node` section of the config: `num`, `long_name`, `short_name`, `role` (advertised only), `hw_model`, `private_key` (base64 X25519, stored only in the local config file, redacted in DB and CLI output), `hop_limit`, `duty_cycle_limit`, `duty_cycle_enforce`.
 
 ## License
 

@@ -136,13 +136,13 @@ enum Cmd {
 #[derive(clap::Args, Clone, Copy)]
 struct WaitOpts {
     /// Seconds to wait for ACK/response per transmission.
-    #[arg(long, default_value_t = 60.0)]
+    #[arg(long, default_value_t = 60.0, global = true)]
     wait: f64,
     /// Retransmissions if nothing is heard.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, global = true)]
     retries: u32,
     /// Override hop limit.
-    #[arg(long)]
+    #[arg(long, global = true)]
     hop_limit: Option<u8>,
 }
 
@@ -205,6 +205,26 @@ fn send_req(to: u32, port: &str, payload: &[u8], want_ack: bool, want_response: 
         "want_ack": want_ack, "want_response": want_response, "pkc": pkc, "channel": channel,
         "hop_limit": w.hop_limit, "wait_s": w.wait, "retries": w.retries,
     })
+}
+
+/// Send our NodeInfo to `to` over the channel, requesting theirs.
+fn nodeinfo_exchange(cfg: &Config, to: u32, w: WaitOpts) -> Result<Value> {
+    let me = cfg.node.num.ok_or_else(|| anyhow!("node.num not set"))?;
+    let pubk = cfg.node.private_key.as_deref().map(pkc::Identity::from_b64).transpose()?.map(|i| i.public_b64());
+    let payload = mesh::user_payload(cfg, me, pubk)?;
+    daemon::call(&cfg.api, &send_req(to, "NODEINFO_APP", &payload, false, true, Some(false), 0, w))
+}
+
+/// PKC send; on PKI_UNKNOWN_PUBKEY NAK, exchange NodeInfo and retry once.
+fn pkc_call(cfg: &Config, req: &Value, to: u32, w: WaitOpts) -> Result<Value> {
+    let r = daemon::call(&cfg.api, req)?;
+    if r["nak"] != "PKI_UNKNOWN_PUBKEY" {
+        return Ok(r);
+    }
+    let ni = nodeinfo_exchange(cfg, to, w)?;
+    let mut r2 = daemon::call(&cfg.api, req)?;
+    r2["key_exchange"] = json!({"first_packet_id": r["packet_id"], "nak": r["nak"], "nodeinfo_acked": ni["acked"]});
+    Ok(r2)
 }
 
 fn set_path(v: &mut Value, path: &str, val: Value) -> Result<()> {
@@ -273,7 +293,11 @@ fn run(cli: &Cli) -> Result<()> {
                 let mut v = serde_json::to_value(&cfg)?;
                 for s in set {
                     let (p, val) = s.split_once('=').ok_or_else(|| anyhow!("expected PATH=VALUE: {s}"))?;
-                    let val = serde_json::from_str(val).unwrap_or(Value::String(val.to_string()));
+                    let val = if p == "node.num" {
+                        json!(packet::parse_node_id(val).ok_or_else(|| anyhow!("bad node id {val}"))?)
+                    } else {
+                        serde_json::from_str(val).unwrap_or(Value::String(val.to_string()))
+                    };
                     set_path(&mut v, p, val)?;
                 }
                 cfg = serde_json::from_value(v).context("invalid config after set")?;
@@ -316,17 +340,13 @@ fn run(cli: &Cli) -> Result<()> {
         Cmd::Send { to, text, channel, no_pkc, no_ack, w } => {
             let to = packet::parse_node_id(to).context("bad node id")?;
             let pkc = if *no_pkc { Some(false) } else { None };
-            let r = daemon::call(&cfg.api, &send_req(to, "TEXT_MESSAGE_APP", text.as_bytes(), !no_ack && to != packet::BROADCAST, false, pkc, *channel, *w))?;
+            let req = send_req(to, "TEXT_MESSAGE_APP", text.as_bytes(), !no_ack && to != packet::BROADCAST, false, pkc, *channel, *w);
+            let r = if to != packet::BROADCAST && !no_pkc { pkc_call(&cfg, &req, to, *w)? } else { daemon::call(&cfg.api, &req)? };
             print(&r);
         }
         Cmd::Nodeinfo { to, w } => {
             let to = packet::parse_node_id(to).context("bad node id")?;
-            let me = cfg.node.num.ok_or_else(|| anyhow!("node.num not set"))?;
-            let pubk = cfg.node.private_key.as_deref().map(pkc::Identity::from_b64).transpose()?.map(|i| i.public_b64());
-            let payload = mesh::user_payload(&cfg, me, pubk)?;
-            // NodeInfo exchange goes over the channel (receiver may not know our key yet).
-            let r = daemon::call(&cfg.api, &send_req(to, "NODEINFO_APP", &payload, false, true, Some(false), 0, *w))?;
-            print(&r);
+            print(&nodeinfo_exchange(&cfg, to, *w)?);
         }
         Cmd::Admin { node, op, w } => {
             let to = packet::parse_node_id(node).context("bad node id")?;
@@ -337,7 +357,7 @@ fn run(cli: &Cli) -> Result<()> {
             let mut results = Vec::new();
             for (label, msg) in items {
                 let payload = proto::encode_json("AdminMessage", &msg)?;
-                let r = daemon::call(&cfg.api, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w));
+                let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w);
                 let entry = match r {
                     Ok(r) => {
                         let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
@@ -345,6 +365,7 @@ fn run(cli: &Cli) -> Result<()> {
                             "item": label, "ok": resp.is_some(), "response": resp, "nak": r["nak"],
                             "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
                             "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
+                            "key_exchange": r.get("key_exchange"),
                             "response_rf": r["responses"].as_array().and_then(|a| a.first()).map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "relay_node": e["relay_node"]})),
                         })
                     }
