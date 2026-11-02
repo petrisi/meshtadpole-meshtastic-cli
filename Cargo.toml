@@ -13,3 +13,20 @@ path = "src/main.rs"
 [dependencies]
 # Switch to git dependency once published.
 meshtadpole-radio = { path = "../meshtadpole-radio" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+prost = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes = "0.8"
+ctr = "0.9"
+dirs = "5"
+ctrlc = "3"
+
+[build-dependencies]
+prost = "0.13"
+protox = "0.7"
