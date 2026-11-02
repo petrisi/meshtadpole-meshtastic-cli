@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS tx_frames(
 );
 CREATE INDEX IF NOT EXISTS tx_frames_time ON tx_frames(tx_time);
 CREATE INDEX IF NOT EXISTS tx_frames_id ON tx_frames(pkt_id);
+
+CREATE TABLE IF NOT EXISTS radio_events(
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER,
+  t REAL NOT NULL,
+  event TEXT NOT NULL,
+  detail TEXT
+);
 
 CREATE TABLE IF NOT EXISTS requests(
   id INTEGER PRIMARY KEY,
@@ -206,6 +214,15 @@ impl Writer {
     pub fn end_session(&self) -> Result<()> {
         let t = now();
         self.c.execute("UPDATE sessions SET last_alive=?1, ended=?1 WHERE id=?2", params![t, self.session_id])?;
+        Ok(())
+    }
+
+    /// Radio lifecycle: connected, disconnected, open_failed, rx_restored.
+    pub fn insert_radio_event(&self, event: &str, detail: &str) -> Result<()> {
+        self.c.execute(
+            "INSERT INTO radio_events(session_id,t,event,detail) VALUES(?1,?2,?3,?4)",
+            params![self.session_id, now(), event, detail],
+        )?;
         Ok(())
     }
 

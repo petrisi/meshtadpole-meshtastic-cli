@@ -86,7 +86,7 @@ enum Cmd {
     },
     /// Remote administration over PKC (requires our key in the target's admin_key list).
     Admin {
-        /// Target node id.
+        /// Target: node id, comma-separated ids, or @group (config `groups`).
         node: String,
         #[command(subcommand)]
         op: AdminOp,
@@ -171,6 +171,12 @@ enum AdminOp {
         #[arg(long)]
         ack_only: bool,
     },
+    /// Ignore NODE on the target: target drops all packets from NODE (no processing, no rebroadcast).
+    /// Uses add_contact{should_ignore}: creates the entry if unknown, never evicted, persisted.
+    /// Not readable back over the air; verify via relay_node in rx_frames.
+    Ignore { node: String },
+    /// Remove NODE from the target's ignore state (remove_ignored_node).
+    Unignore { node: String },
     /// Read-modify-write one item (config:<name>, module:<name>, channel:<n>, owner).
     /// CHANGES is a JSON object merged into the current value (objects merge, arrays replace, null = default).
     /// Dry run unless --apply. Security, lora and channel 0 writes also need --allow-disruptive.
@@ -196,6 +202,54 @@ const MODULE_TYPES: &[&str] = &[
 ];
 
 /// Expand admin get item names into (label, AdminMessage JSON).
+fn op_label(op: &AdminOp) -> String {
+    match op {
+        AdminOp::Ignore { node } => format!("ignore:{node}"),
+        AdminOp::Unignore { node } => format!("unignore:{node}"),
+        _ => "raw".into(),
+    }
+}
+
+/// AdminMessage add_contact with should_ignore; User from our node table when known.
+fn ignore_msg(db_path: &std::path::Path, node: &str) -> Result<Value> {
+    let n = packet::parse_node_id(node).context("bad node id")?;
+    let mut user = json!({"id": packet::node_id(n)});
+    if let Ok(c) = store::open_ro(db_path) {
+        if let Some(row) = store::query_json(&c, "SELECT user_json FROM nodes WHERE num = ?1", &[&n])?.into_iter().next() {
+            if let Some(u) = row["user_json"].as_object() {
+                for k in ["long_name", "short_name", "hw_model"] {
+                    if let Some(v) = u.get(k) {
+                        user[k] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({"add_contact": {"node_num": n, "user": user, "should_ignore": true}}))
+}
+
+/// Targets: node id, comma-separated list, or @group (config `groups`). Duplicates removed, order kept.
+fn parse_targets(cfg: &Config, spec: &str) -> Result<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let ids: Vec<String> = if let Some(g) = part.strip_prefix('@') {
+            cfg.groups.get(g).cloned().ok_or_else(|| anyhow!("unknown group @{g}"))?
+        } else {
+            vec![part.to_string()]
+        };
+        for id in ids {
+            let n = packet::parse_node_id(&id).ok_or_else(|| anyhow!("bad node id {id}"))?;
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("no targets");
+    }
+    Ok(out)
+}
+
 fn admin_items(items: &[String]) -> Result<Vec<(String, Value)>> {
     let mut out = Vec::new();
     for it in items {
@@ -237,6 +291,85 @@ fn send_req(to: u32, port: &str, payload: &[u8], want_ack: bool, want_response: 
         "want_ack": want_ack, "want_response": want_response, "pkc": pkc, "channel": channel,
         "hop_limit": w.hop_limit, "wait_s": w.wait, "retries": w.retries,
     })
+}
+
+/// One admin operation against one target.
+fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: &WaitOpts) -> Result<Value> {
+        let items = match op {
+            AdminOp::Get { items } => admin_items(items)?,
+            AdminOp::Raw { .. } | AdminOp::Ignore { .. } | AdminOp::Unignore { .. } => {
+                let mut msg: Value = match op {
+                    AdminOp::Raw { json: j, .. } => serde_json::from_str(j).context("AdminMessage JSON")?,
+                    AdminOp::Ignore { node } => ignore_msg(db_path, node)?,
+                    AdminOp::Unignore { node } => {
+                        json!({"remove_ignored_node": packet::parse_node_id(node).context("bad node id")?})
+                    }
+                    _ => unreachable!(),
+                };
+                let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
+                if !is_get && msg.get("session_passkey").is_none() {
+                    let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
+                    let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
+                    let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
+                    msg["session_passkey"] = json!(pk);
+                }
+                vec![(op_label(op), msg)]
+            }
+            AdminOp::Set { item, changes, apply, allow_disruptive, verify_delay } => {
+                let items = admin_items(std::slice::from_ref(item))?;
+                if items.len() != 1 {
+                    bail!("set takes exactly one item");
+                }
+                let changes: Value = serde_json::from_str(changes).context("CHANGES JSON")?;
+                let req = json!({
+                    "cmd": "admin_set", "to": to, "get": items[0].1, "changes": changes,
+                    "apply": apply, "allow_disruptive": allow_disruptive, "verify_delay_s": verify_delay,
+                    "wait_s": w.wait, "retries": w.retries, "hop_limit": w.hop_limit,
+                });
+                let r = match daemon::call(&cfg.api, &req) {
+                    Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
+                        nodeinfo_exchange(&cfg, to, *w)?;
+                        daemon::call(&cfg.api, &req)?
+                    }
+                    r => r?,
+                };
+                return Ok(r);
+            }
+        };
+        let mut results = Vec::new();
+        for (label, msg) in items {
+            let payload = proto::encode_json("AdminMessage", &msg)?;
+            // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
+            let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
+            let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
+            let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w);
+            let entry = match r {
+                Ok(r) => {
+                    let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
+                    // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
+                    let ok = if is_get {
+                        resp.is_some()
+                    } else if ack_only {
+                        r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
+                    } else {
+                        r["nak"].is_null()
+                    };
+                    json!({
+                        "item": label, "ok": ok, "acked": r["acked"], "response": resp, "nak": r["nak"],
+                        "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
+                        "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
+                        "key_exchange": r.get("key_exchange"),
+                        "response_rf": r["responses"].as_array().and_then(|a| a.first()).map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "relay_node": e["relay_node"]})),
+                    })
+                }
+                Err(e) => json!({"item": label, "ok": false, "error": format!("{e:#}")}),
+            };
+            eprintln!("{}", json!({"progress": entry["item"], "ok": entry["ok"]}));
+            results.push(entry);
+        }
+        Ok(json!({"node": packet::node_id(to), "results": results}))
 }
 
 /// Send our NodeInfo to `to` over the channel, requesting theirs.
@@ -374,7 +507,8 @@ fn set_path(v: &mut Value, path: &str, val: Value) -> Result<()> {
     }
     let last = parts[parts.len() - 1];
     let obj = cur.as_object_mut().ok_or_else(|| anyhow!("{path}: parent is not an object"))?;
-    if !obj.contains_key(last) {
+    // `groups.<name>` may be created; other keys must exist.
+    if !obj.contains_key(last) && !(parts.len() == 2 && parts[0] == "groups") {
         bail!("no such key {last} in {path}");
     }
     obj.insert(last.into(), val);
@@ -493,76 +627,20 @@ fn run(cli: &Cli) -> Result<()> {
             print(&nodeinfo_exchange(&cfg, to, *w)?);
         }
         Cmd::Admin { node, op, w } => {
-            let to = packet::parse_node_id(node).context("bad node id")?;
-            let items = match op {
-                AdminOp::Get { items } => admin_items(items)?,
-                AdminOp::Raw { json: j, .. } => {
-                    let mut msg: Value = serde_json::from_str(j).context("AdminMessage JSON")?;
-                    let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
-                    if !is_get && msg.get("session_passkey").is_none() {
-                        let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
-                        let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
-                        let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
-                        msg["session_passkey"] = json!(pk);
-                    }
-                    vec![("raw".into(), msg)]
-                }
-                AdminOp::Set { item, changes, apply, allow_disruptive, verify_delay } => {
-                    let items = admin_items(std::slice::from_ref(item))?;
-                    if items.len() != 1 {
-                        bail!("set takes exactly one item");
-                    }
-                    let changes: Value = serde_json::from_str(changes).context("CHANGES JSON")?;
-                    let req = json!({
-                        "cmd": "admin_set", "to": to, "get": items[0].1, "changes": changes,
-                        "apply": apply, "allow_disruptive": allow_disruptive, "verify_delay_s": verify_delay,
-                        "wait_s": w.wait, "retries": w.retries, "hop_limit": w.hop_limit,
+            let targets = parse_targets(&cfg, node)?;
+            if targets.len() == 1 {
+                print(&admin_one(&cfg, &db_path, targets[0], op, w)?);
+            } else {
+                let mut out = Vec::new();
+                for t in targets {
+                    eprintln!("{}", json!({"target": packet::node_id(t)}));
+                    out.push(match admin_one(&cfg, &db_path, t, op, w) {
+                        Ok(v) => json!({"node": packet::node_id(t), "ok": true, "result": v}),
+                        Err(e) => json!({"node": packet::node_id(t), "ok": false, "error": format!("{e:#}")}),
                     });
-                    let r = match daemon::call(&cfg.api, &req) {
-                        Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
-                            nodeinfo_exchange(&cfg, to, *w)?;
-                            daemon::call(&cfg.api, &req)?
-                        }
-                        r => r?,
-                    };
-                    print(&r);
-                    return Ok(());
                 }
-            };
-            let mut results = Vec::new();
-            for (label, msg) in items {
-                let payload = proto::encode_json("AdminMessage", &msg)?;
-                // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
-                let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
-                let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
-                let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w);
-                let entry = match r {
-                    Ok(r) => {
-                        let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
-                        // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
-                        let ok = if is_get {
-                            resp.is_some()
-                        } else if ack_only {
-                            r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
-                        } else {
-                            r["nak"].is_null()
-                        };
-                        json!({
-                            "item": label, "ok": ok, "acked": r["acked"], "response": resp, "nak": r["nak"],
-                            "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
-                            "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
-                            "key_exchange": r.get("key_exchange"),
-                            "response_rf": r["responses"].as_array().and_then(|a| a.first()).map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "relay_node": e["relay_node"]})),
-                        })
-                    }
-                    Err(e) => json!({"item": label, "ok": false, "error": format!("{e:#}")}),
-                };
-                eprintln!("{}", json!({"progress": entry["item"], "ok": entry["ok"]}));
-                results.push(entry);
+                print(&json!({"targets": out}));
             }
-            print(&json!({"node": packet::node_id(to), "results": results}));
         }
         Cmd::Daemon => daemon::run(&cfg, &db_path)?,
         Cmd::Status => {

@@ -1,6 +1,6 @@
 # Database schema
 
-SQLite, WAL mode. `meta.schema_version` = 2. Full DDL: `tadpole-mt schema`. Times are Unix seconds (REAL, host clock). Node numbers are unsigned 32-bit stored as INTEGER.
+SQLite, WAL mode. `meta.schema_version` = 3. Full DDL: `tadpole-mt schema`. Times are Unix seconds (REAL, host clock). Node numbers are unsigned 32-bit stored as INTEGER.
 
 ## sessions
 
@@ -79,6 +79,15 @@ Every transmission by this node (including retransmissions).
 | error | radio error, NULL on success |
 
 Our packets heard back via relays appear in `rx_frames` with `pkt_from` = our node num.
+
+## radio_events
+
+| Column | Meaning |
+|---|---|
+| t, session_id | |
+| event | `connected` (detail = USB serial), `disconnected`, `open_failed` (detail = error; logged when the error changes), `rx_restored` (watchdog) |
+
+Gaps in reception: combine `sessions` (daemon running) with `radio_events` (stick connected).
 
 ## requests
 

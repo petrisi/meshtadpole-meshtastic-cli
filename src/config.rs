@@ -87,6 +87,9 @@ pub struct Config {
     /// Decoded payload field names replaced with `<redacted>` in output and storage (any nesting level).
     #[serde(default = "default_redact")]
     pub redact_fields: Vec<String>,
+    /// Named node lists for bulk operations, referenced as `@name`.
+    #[serde(default)]
+    pub groups: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn default_redact() -> Vec<String> {
@@ -113,6 +116,7 @@ impl Default for Config {
             api: DEFAULT_API.into(),
             usb_serial: None,
             redact_fields: default_redact(),
+            groups: Default::default(),
         }
     }
 }

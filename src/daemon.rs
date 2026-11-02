@@ -245,6 +245,7 @@ fn admin_req(to: u32, msg: &Value, want_response: bool, base: &Value) -> Result<
         request_id: None,
         wait_s: base["wait_s"].as_f64().unwrap_or(60.0),
         retries: base["retries"].as_u64().unwrap_or(1) as u32,
+        from: None,
     })
 }
 
@@ -408,6 +409,7 @@ fn auto_replies(
             request_id: Some(request_id),
             wait_s: 0.0,
             retries: 0,
+            from: None,
         };
         mesh::build(me, sh.cfg.node.hop_limit, &req, &sh.channels, None).ok()
     };
@@ -419,7 +421,7 @@ fn auto_replies(
 
     // Responders (a response replaces the ACK, as in firmware).
     let mut responded = false;
-    if d.status == crate::decode::Status::Ok && want_response {
+    if d.status == crate::decode::Status::Ok && want_response && !has_req_or_reply && d.portnum != Some(5) {
         match d.portnum {
             Some(4) => {
                 let pubk = sh.pkc.as_ref().map(|p| p.read().unwrap().id.public_b64());
@@ -439,7 +441,17 @@ fn auto_replies(
                     responded = true;
                 }
             }
-            _ => {}
+            // Unhandled request: firmware MeshModule sends NO_RESPONSE when no module replies;
+            // AdminModule answers unauthorized admin with NOT_AUTHORIZED.
+            Some(6) => {
+                out.extend(mk("ROUTING_APP", routing("NOT_AUTHORIZED"), h.id, resp_hops, false));
+                responded = true;
+            }
+            Some(_) => {
+                out.extend(mk("ROUTING_APP", routing("NO_RESPONSE"), h.id, resp_hops, false));
+                responded = true;
+            }
+            None => {}
         }
     }
     if h.want_ack && !responded {
@@ -498,15 +510,30 @@ fn channel_busy(radio: &mut sx1262::Sx1262, since: &mut Option<Instant>) -> Resu
     Ok(true)
 }
 
+/// Open, configure and start RX on the stick.
+fn open_radio(cfg: &Config, lora: &sx1262::LoraConfig) -> Result<(sx1262::Sx1262, String)> {
+    let bus = ch341::Ch341::open(cfg.usb_serial.as_deref()).context("open MeshTadpole")?;
+    let usb_serial = bus.info.serial.clone().unwrap_or_default();
+    let mut radio = sx1262::Sx1262::new(bus, sx1262::MESHTADPOLE_PINS)?;
+    radio.configure(lora).context("configure SX1262")?;
+    radio.start_rx()?;
+    Ok((radio, usb_serial))
+}
+
+/// Error originates from the USB/radio layer (reconnect) rather than DB/logic (exit).
+fn is_radio_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<meshtadpole_radio::Error>().is_some())
+}
+
 pub fn run(cfg: &Config, db: &Path) -> Result<()> {
     let listener = TcpListener::bind(&cfg.api).with_context(|| format!("bind API {} (daemon already running?)", cfg.api))?;
     let channels = cfg.channels()?;
     let lora = cfg.lora()?;
-    let bus = ch341::Ch341::open(cfg.usb_serial.as_deref()).context("open MeshTadpole")?;
-    let usb_serial = bus.info.serial.clone().unwrap_or_default();
-    let mut radio = sx1262::Sx1262::new(bus, sx1262::MESHTADPOLE_PINS)?;
-    radio.configure(&lora).context("configure SX1262")?;
-    radio.start_rx()?;
+    // Start even without the stick; the main loop keeps retrying.
+    let (mut radio_opt, usb_serial, open_err) = match open_radio(cfg, &lora) {
+        Ok((r, s)) => (Some(r), s, None),
+        Err(e) => (None, String::new(), Some(format!("{e:#}"))),
+    };
 
     let w = Writer::start_session(store::open_rw(db)?, &usb_serial, &lora, &serde_json::to_string(&redacted(cfg))?)?;
     let me = cfg.node.num;
@@ -550,6 +577,17 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
         ctrlc::set_handler(move || sh.stop.store(true, Ordering::SeqCst)).ok();
     }
     eprintln!("{}", json!({"event": "started", "status": *sh.status.lock().unwrap()}));
+    match &open_err {
+        None => w.insert_radio_event("connected", &usb_serial)?,
+        Some(e) => {
+            w.insert_radio_event("open_failed", e)?;
+            eprintln!("{}", json!({"event": "open_failed", "error": e}));
+        }
+    }
+    sh.status.lock().unwrap()["radio"] = json!(if radio_opt.is_some() { "connected" } else { "disconnected" });
+    let mut backoff = Duration::from_secs(1);
+    let mut next_try = Instant::now() + backoff;
+    let mut last_open_err = open_err;
 
     let mut stat_t0 = store::now();
     let mut last_stat = Instant::now();
@@ -560,7 +598,50 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
     let mut busy_since: Option<Instant> = None;
     let mut acked_recent: HashMap<(u32, u32), Instant> = HashMap::new();
 
-    let res: Result<()> = (|| {
+    let res: Result<()> = loop {
+        if sh.stop.load(Ordering::SeqCst) {
+            break Ok(());
+        }
+        let Some(radio) = radio_opt.as_mut() else {
+            // Disconnected: fail queued TX, keep heartbeat, retry open with backoff (max 30 s).
+            while let Ok(job) = qrx.try_recv() {
+                let _ = job.done.send(Err(anyhow!("radio not connected")));
+            }
+            for (job, _) in pending.drain(..) {
+                let _ = job.done.send(Err(anyhow!("radio not connected")));
+            }
+            if last_stat.elapsed() >= Duration::from_secs(60) {
+                w.heartbeat()?;
+                last_stat = Instant::now();
+                stat_t0 = store::now();
+            }
+            if Instant::now() >= next_try {
+                match open_radio(cfg, &lora) {
+                    Ok((r, serial)) => {
+                        w.insert_radio_event("connected", &serial)?;
+                        eprintln!("{}", json!({"event": "connected", "usb_serial": serial}));
+                        sh.status.lock().unwrap()["radio"] = json!("connected");
+                        sh.status.lock().unwrap()["usb_serial"] = json!(serial);
+                        radio_opt = Some(r);
+                        backoff = Duration::from_secs(1);
+                        last_open_err = None;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if last_open_err.as_deref() != Some(msg.as_str()) {
+                            w.insert_radio_event("open_failed", &msg)?;
+                            eprintln!("{}", json!({"event": "open_failed", "error": msg}));
+                            last_open_err = Some(msg);
+                        }
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        next_try = Instant::now() + backoff;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let r: Result<()> = (|| {
         while !sh.stop.load(Ordering::SeqCst) {
             while let Ok(job) = qrx.try_recv() {
                 let backoff = Duration::from_millis(rand::random::<u64>() % 400);
@@ -619,13 +700,13 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
             if !did_rx {
                 if let Some((_, at)) = pending.front() {
                     if Instant::now() >= *at {
-                        if channel_busy(&mut radio, &mut busy_since)? {
+                        if channel_busy(radio, &mut busy_since)? {
                             let (job, _) = pending.pop_front().unwrap();
                             let at = Instant::now() + Duration::from_millis(200 + rand::random::<u64>() % 600);
                             pending.push_front((job, at));
                         } else {
                             let (job, _) = pending.pop_front().unwrap();
-                            let r = transmit(&mut radio, &lora, &sh, &w, &job);
+                            let r = transmit(radio, &lora, &sh, &w, &job);
                             let _ = job.done.send(r);
                         }
                     }
@@ -644,6 +725,13 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
                 let avg = if n > 0 { nsum / n as f32 } else { f32::NAN };
                 w.insert_radio_stats(stat_t0, t1, n, nmin, avg, nmax, frames, crc, hdr, air)?;
                 w.heartbeat()?;
+                // Watchdog: chip must be in RX (mode 5) when idle; otherwise reconfigure.
+                let (mode, _) = sx1262::status_fields(radio.get_status()?);
+                if mode != 5 && pending.is_empty() {
+                    radio.configure(&lora)?;
+                    radio.start_rx()?;
+                    w.insert_radio_event("rx_restored", &format!("chip mode was {mode}"))?;
+                }
                 (n, nmin, nsum, nmax) = (0, f32::MAX, 0.0, f32::MIN);
                 (frames, crc, hdr, air) = (0, 0, 0, 0.0);
                 stat_t0 = t1;
@@ -651,7 +739,22 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
             }
         }
         Ok(())
-    })();
+        })();
+        match r {
+            Ok(()) => break Ok(()),
+            Err(e) if is_radio_error(&e) => {
+                let msg = format!("{e:#}");
+                w.insert_radio_event("disconnected", &msg)?;
+                eprintln!("{}", json!({"event": "disconnected", "error": msg}));
+                sh.status.lock().unwrap()["radio"] = json!("disconnected");
+                radio_opt = None;
+                busy_since = None;
+                backoff = Duration::from_secs(1);
+                next_try = Instant::now() + backoff;
+            }
+            Err(e) => break Err(e),
+        }
+    };
     w.end_session()?;
     eprintln!("{}", json!({"event": "stopped", "error": res.as_ref().err().map(|e| format!("{e:#}"))}));
     res

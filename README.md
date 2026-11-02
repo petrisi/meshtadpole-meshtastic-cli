@@ -58,7 +58,9 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 | Remote admin read (owner, metadata, channels, configs, modules) | working (2.7.26) |
 | Remote admin set: read-modify-write, dry run, guards, verify | working (2.7.26: config, security, module, owner, channel) |
 | Requests: telemetry, position, traceroute, neighborinfo | working |
-| ACK/NAK of packets to us; NodeInfo and traceroute responders | working |
+| ACK/NAK of packets to us; NodeInfo and traceroute responders; NO_RESPONSE for others | working |
+| Bulk admin targets (lists, @groups), ignore/unignore | working |
+| Daemon: start without stick, reconnect, RX watchdog | implemented; unplug test pending |
 | AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
 | Linux | untested |
 

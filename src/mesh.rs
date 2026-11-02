@@ -36,6 +36,9 @@ pub struct SendReq {
     /// Retransmissions after the first attempt if nothing is heard.
     #[serde(default)]
     pub retries: u32,
+    /// Testing aid (API only): originate as another node number. Channel encryption only.
+    #[serde(default)]
+    pub from: Option<u32>,
 }
 
 fn default_wait() -> f64 {
@@ -71,6 +74,15 @@ pub fn random_id() -> u32 {
 }
 
 pub fn build(me: u32, hop_limit_default: u8, req: &SendReq, channels: &[Channel], pkc_ctx: Option<&PkcCtx>) -> Result<Outgoing> {
+    let (me, pkc_ctx) = match req.from {
+        Some(f) if f != me => {
+            if req.pkc == Some(true) {
+                bail!("from override requires channel encryption");
+            }
+            (f, None)
+        }
+        _ => (me, pkc_ctx),
+    };
     let portnum = port_number(&req.port)?;
     let payload = base64::engine::general_purpose::STANDARD.decode(&req.payload_b64).context("payload_b64")?;
     let mut data = json!({

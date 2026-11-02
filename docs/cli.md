@@ -24,6 +24,7 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 | `send <TO> <TEXT> [--channel N] [--no-pkc] [--no-ack]` | daemon | send result (below). Unicast uses PKC when the destination key is known |
 | `request <TO> <KIND>` | daemon | request result (see Requests) |
 | `nodeinfo <TO>` | daemon | send our User (incl. public key) over the channel with want_response |
+| `admin <TARGETS> ignore <NODE>` / `unignore <NODE>` | daemon | per-target result (see Ignore) |
 | `admin <NODE> get <ITEM>...` | daemon | `{node, results[]}`; one admin request per item. Progress lines on stderr |
 | `admin <NODE> raw '<JSON>'` | daemon | arbitrary `meshtastic.AdminMessage` as proto3 JSON |
 | `admin <NODE> set <ITEM> '<CHANGES>' [--apply] [--allow-disruptive]` | daemon | read-modify-write result (see Admin writes) |
@@ -38,6 +39,8 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 | `decode <hex>` | — | decode a raw frame with configured channels |
 
 Node IDs: `!xxxxxxxx`, `xxxxxxxx`, `0xxxxxxxxx`, decimal, `^all` (broadcast).
+
+Admin TARGETS: one node id, comma-separated ids, or `@group` (config `groups`, e.g. `config --set 'groups.zerg=["!3948c983","!59a5f896"]'`); mixable, duplicates removed. With more than one target the output is `{"targets":[{"node","ok","result"|"error"}]}`; a failing target does not stop the others.
 
 `--since S` is seconds before now.
 
@@ -61,6 +64,16 @@ Config `redact_fields` (default `["private_key","wifi_psk"]`): decoded payload f
 - Set: `config --set 'redact_fields=["private_key","wifi_psk","fixed_pin"]'`. Restart daemon to apply.
 - Not covered: `rx_frames.raw` (encrypted frame; decryptable with `node.private_key`), rows stored before a field was added.
 - Writes never take secret values from the caller; see Admin writes.
+
+## Ignore
+
+`admin <TARGETS> ignore <NODE>` sends `add_contact{node_num, user, should_ignore:true}` (User from our `nodes` table when known); `unignore` sends `remove_ignored_node`. Both are passkey-protected writes (want_response: NAK = rejected, silence = accepted).
+
+Firmware (2.7.26) effect on the target: packets from NODE are dropped in `Router::handleReceived` before decoding, handling and rebroadcast; the entry is created if unknown, never evicted, persisted, and its public key is cleared. `set_ignored_node` (field 47) is not used because it silently does nothing when NODE is not in the target's NodeDB.
+
+The ignore state is not readable over the air. Verification options: NODE's packets stop carrying the target's `relay_node` byte in `rx_frames` (rebroadcasting roles only); or a request originated as NODE gets no reply.
+
+Verified on !3948c983 with fictitious node !00000002: traceroute reply before ignore, none after (×2), reply again after unignore.
 
 ## Admin writes
 
@@ -145,6 +158,8 @@ Traceroute adds `forward` and `back`: `[{from, to, snr_db}]` per hop; `snr_db` m
 | want_ack, no channel / decode error | NAK NO_CHANNEL |
 | NODEINFO_APP with want_response | our User (replaces ACK) |
 | TRACEROUTE_APP with want_response | RouteDiscovery with our SNR appended to snr_towards (replaces ACK) |
+| ADMIN_APP with want_response | NAK NOT_AUTHORIZED |
+| any other request with want_response | NAK NO_RESPONSE (as firmware when no module replies) |
 
 All automatic replies use channel encryption, are rate-limited to one per (from, id) per 5 s, and are logged in `tx_frames`. Without ACKs, firmware retransmits want_ack replies (observed up to 4 copies).
 
@@ -172,6 +187,13 @@ All automatic replies use channel encryption, are rate-limited to one per (from,
 - `dup_of`: frame id of the first reception of the same (`from`,`id`) within 1 h; null for first reception.
 - `header_error` events carry only `frame_id`, `rx_time`, `status`, `rssi` (instantaneous).
 
+## Daemon resilience
+
+- Starts without the stick and keeps retrying.
+- USB/radio error: daemon and API stay up; `radio_events` gets `disconnected`; reopen retried with backoff 1 s → 30 s max; `connected` on success (radio fully reconfigured). Queued and new sends fail with `radio not connected` meanwhile. `status.radio` = `connected`/`disconnected`.
+- Watchdog every 60 s: if the SX1262 is not in RX mode while idle, it is reconfigured (`rx_restored`).
+- Non-radio errors (e.g. database) stop the daemon; run it under a service manager for restart.
+
 ## Daemon API
 
 TCP `config.api` (default `127.0.0.1:47403`), one JSON object per line.
@@ -180,6 +202,7 @@ TCP `config.api` (default `127.0.0.1:47403`), one JSON object per line.
 |---|---|
 | `{"cmd":"status"}` | one status object |
 | `{"cmd":"subscribe"}` | `{"subscribed":true}` then frame events until disconnect |
-| `{"cmd":"send","to":N,"port":"NAME","payload_b64":"..","want_ack":b,"want_response":b,"pkc":b\|null,"channel":i,"hop_limit":n\|null,"wait_s":f,"retries":n}` | send result |
+| `{"cmd":"send","to":N,"port":"NAME","payload_b64":"..","want_ack":b,"want_response":b,"pkc":b\|null,"channel":i,"hop_limit":n\|null,"wait_s":f,"retries":n,"from":n\|null}` | send result. `from`: testing aid, originate as another node number (channel encryption only) |
+| `{"cmd":"admin_set",...}` | admin write result (see Admin writes) |
 
 One daemon per stick; a second daemon fails to bind the API port.
