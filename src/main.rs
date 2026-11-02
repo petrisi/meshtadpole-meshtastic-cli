@@ -306,17 +306,29 @@ fn request(cfg: &Config, to: u32, kind: &str, w: WaitOpts) -> Result<Value> {
     // PKC requests set want_ack: firmware sends PKI_UNKNOWN_PUBKEY only for want_ack packets.
     let req = send_req(to, port, &payload, pkc != Some(false), true, pkc, 0, w);
     let mut r = if pkc == Some(false) { daemon::call(&cfg.api, &req)? } else { pkc_call(cfg, &req, to, w)? };
-    // PKC request with no response and no NAK (NAK lost on multi-hop path): exchange NodeInfo, retry once.
-    if pkc != Some(false)
-        && r["encryption"] == "pkc"
-        && r["responses"].as_array().is_none_or(|a| a.is_empty())
-        && r["nak"].is_null()
-        && r.get("key_exchange").is_none()
-    {
-        let first = r["packet_id"].clone();
-        let ni = nodeinfo_exchange(cfg, to, w)?;
+    // No response and no NAK. Observed: the first request after an idle period goes unanswered while an
+    // immediate repeat succeeds (likely a NeighborInfo reply lost or suppressed, see below). So: repeat once;
+    // if still nothing on a PKC request, the NAK may have been lost -> exchange NodeInfo and try once more.
+    let empty = |r: &Value| r["responses"].as_array().is_none_or(|a| a.is_empty()) && r["nak"].is_null();
+    let mut unanswered = Vec::new();
+    if empty(&r) && r.get("key_exchange").is_none() {
+        unanswered.push(r["packet_id"].clone());
         r = daemon::call(&cfg.api, &req)?;
-        r["key_exchange"] = json!({"first_packet_id": first, "reason": "no response", "nodeinfo_acked": ni["acked"]});
+        if pkc != Some(false) && r["encryption"] == "pkc" && empty(&r) {
+            unanswered.push(r["packet_id"].clone());
+            let ni = nodeinfo_exchange(cfg, to, w)?;
+            r = daemon::call(&cfg.api, &req)?;
+            r["key_exchange"] = json!({"reason": "no response after repeat", "nodeinfo_acked": ni["acked"]});
+        }
+    }
+    // Firmware bug: with NeighborInfo enabled, its wantPacket() accepts every packet and it is registered
+    // before the telemetry modules, so it answers want_response requests on other ports. Its reply is
+    // throttled to 1 per 3 min; an immediate repeat therefore reaches the intended module.
+    let mut incidental = Vec::new();
+    let first_port = r["responses"][0]["port"].clone();
+    if first_port == "NEIGHBORINFO_APP" && port != "NEIGHBORINFO_APP" {
+        incidental.push(json!({"packet_id": r["packet_id"], "port": first_port, "payload": r["responses"][0]["data"]["payload"]}));
+        r = daemon::call(&cfg.api, &req)?;
     }
     let resp = r["responses"].as_array().and_then(|a| a.first()).cloned();
     let mut out = json!({
@@ -326,6 +338,8 @@ fn request(cfg: &Config, to: u32, kind: &str, w: WaitOpts) -> Result<Value> {
         "response_port": resp.as_ref().map(|e| e["port"].clone()),
         "nak": r["nak"],
         "key_exchange": r.get("key_exchange"),
+        "incidental_responses": incidental,
+        "unanswered_packet_ids": unanswered,
         "transmissions": r["transmissions"].as_array().map(|a| a.len()),
         "relays_heard": r["relays_heard"],
         "response": resp.as_ref().map(|e| e["data"]["payload"].clone()),

@@ -124,11 +124,14 @@ Telemetry variants: `device` (default), `local_stats`, `environment`, `power`, `
 | neighbors | NEIGHBORINFO_APP | channel | only if NeighborInfo module enabled; 1 reply per 3 min |
 | nodeinfo | NODEINFO_APP | channel | same as `nodeinfo` command |
 
-Result: `to`, `kind`, `packet_id`, `encryption`, `ok`, `response_port`, `nak`, `key_exchange`, `transmissions`, `relays_heard`, `response` (payload), `response_rf` (`rssi`, `snr`, `hops_taken`, `hop_start`, `relay_node`, `rx_time`, `frame_id`), `note`.
+Result: `to`, `kind`, `packet_id`, `encryption`, `ok`, `response_port`, `nak`, `key_exchange`, `incidental_responses`, `unanswered_packet_ids`, `transmissions`, `relays_heard`, `response` (payload), `response_rf` (`rssi`, `snr`, `hops_taken`, `hop_start`, `relay_node`, `rx_time`, `frame_id`), `note`.
 Traceroute adds `forward` and `back`: `[{from, to, snr_db}]` per hop; `snr_db` measured by the receiving node of that hop (last back hop measured by us). Unknown SNR = null.
 
-- `ok` requires `response_port` = requested port. Observed: a node answered TELEMETRY_APP with NEIGHBORINFO_APP (firmware lets the first module that wants the packet reply; NeighborInfo wants all packets).
-- PKC: firmware sends PKI_UNKNOWN_PUBKEY only for want_ack packets, and the NAK can be lost on multi-hop paths. On NAK or on no response at all, the CLI sends our NodeInfo and retries once (`key_exchange`).
+- `ok` requires `response_port` = requested port.
+- Firmware bug (2.7.26 and current master): with NeighborInfo enabled, `NeighborInfoModule::wantPacket()` returns true for every packet and the module is registered before the telemetry modules (`Modules.cpp`). `MeshModule::callModules` lets the first wanting module answer a want_response request, so TELEMETRY_APP requests are answered with NEIGHBORINFO_APP. NeighborInfo replies at most once per 3 min; within that window the telemetry module answers. The CLI therefore repeats the request once when it gets NEIGHBORINFO_APP to a non-neighbor request; the first reply is kept in `incidental_responses`. Admin, position, nodeinfo and traceroute modules are registered earlier and are not affected.
+- The request bytes are fixed by unit tests (`proto::tests`), e.g. device telemetry: Data `08 43 12 02 12 00 18 01`.
+- No response and no NAK: the CLI repeats the request once (`unanswered_packet_ids`). If a PKC request is still unanswered, it sends our NodeInfo and tries once more (`key_exchange.reason = "no response after repeat"`; heuristic, the NAK may have been lost). On NAK PKI_UNKNOWN_PUBKEY the NodeInfo exchange happens directly.
+- Observed on !a5139fee (RAK4631, NeighborInfo enabled, 4 hops): the first telemetry request after an idle period got NEIGHBORINFO_APP once and no reply twice; a repeat within ~3 min returned TELEMETRY_APP each time. The missing replies are consistent with NeighborInfo replies being lost or suppressed; not confirmed.
 - No response and no NAK: request lost, module disabled, or reply throttled.
 
 ## Automatic replies (daemon)
