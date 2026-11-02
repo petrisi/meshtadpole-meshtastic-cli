@@ -52,7 +52,13 @@ Admin requests are PKC-encrypted with `node.private_key`; the target must list o
 
 Responses include `session_passkey`; set operations must echo it within 300 s (not yet exposed).
 
-`private_key` fields in decoded payloads (e.g. `get_config_response.security`) are replaced with `<redacted>` in output and storage. Firmware returns the node private key to authorized admins.
+## Redaction
+
+Config `redact_fields` (default `["private_key","wifi_psk"]`): decoded payload fields with these names, at any nesting level, are replaced with `<redacted>` before storage (`rx_frames.data_json`, `requests.result_json`) and output. Matching is by field name only. Firmware returns the node private key to authorized admins in `get_config_response.security`.
+
+- Set: `config --set 'redact_fields=["private_key","wifi_psk","fixed_pin"]'`. Restart daemon to apply.
+- Not covered: `rx_frames.raw` (encrypted frame; decryptable with `node.private_key`), rows stored before a field was added.
+- Admin writes do not yet exist; handling of redacted values in writes is unspecified.
 
 ## Send result
 

@@ -48,14 +48,25 @@ impl Decoded {
     }
 }
 
-/// Field names whose values are replaced with `<redacted>` in decoded output and storage.
-pub const SECRET_FIELDS: &[&str] = &["private_key"];
+/// Default field names whose values are replaced with `<redacted>` in decoded output and storage.
+pub const DEFAULT_REDACT_FIELDS: &[&str] = &["private_key", "wifi_psk"];
+
+static REDACT_FIELDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the redaction list once at startup (from config `redact_fields`).
+pub fn set_redact_fields(f: Vec<String>) {
+    let _ = REDACT_FIELDS.set(f);
+}
+
+fn redact_fields() -> &'static [String] {
+    REDACT_FIELDS.get_or_init(|| DEFAULT_REDACT_FIELDS.iter().map(|s| s.to_string()).collect())
+}
 
 pub fn redact(v: &mut Value) {
     match v {
         Value::Object(m) => {
             for (k, x) in m.iter_mut() {
-                if SECRET_FIELDS.contains(&k.as_str()) && !x.is_null() {
+                if redact_fields().iter().any(|f| f == k) && !x.is_null() {
                     *x = Value::String("<redacted>".into());
                 } else {
                     redact(x);
@@ -188,6 +199,23 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
         return Decoded::bare(Status::Pkc, Some(h));
     }
     Decoded::bare(Status::NoChannel, Some(h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn redact_default_nested() {
+        let mut v = json!({"get_config_response": {
+            "security": {"private_key": "SECRET", "public_key": "PUB", "admin_key": ["A"]},
+            "network": {"wifi_psk": "W", "wifi_ssid": "S"}}});
+        redact(&mut v);
+        let s = &v["get_config_response"];
+        assert_eq!(s["security"]["private_key"], "<redacted>");
+        assert_eq!(s["security"]["public_key"], "PUB");
+        assert_eq!(s["network"]["wifi_psk"], "<redacted>");
+        assert_eq!(s["network"]["wifi_ssid"], "S");
+    }
 }
 
 /// Compact JSON for a decoded frame, used by `listen` and `decode`.

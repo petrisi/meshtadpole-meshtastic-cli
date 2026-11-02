@@ -270,6 +270,7 @@ fn main() {
 fn run(cli: &Cli) -> Result<()> {
     let (cfg_path, db_path) = paths(cli);
     let cfg = Config::load(&cfg_path)?;
+    decode::set_redact_fields(cfg.redact_fields.clone());
     match &cli.cmd {
         Cmd::Devices => {
             let list = meshtadpole_radio::ch341::list(meshtadpole_radio::ch341::VID, meshtadpole_radio::ch341::PID)?;

@@ -63,6 +63,8 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 
 ## Node identity
 
+Top-level `redact_fields`: payload field names masked in DB and output (default `private_key`, `wifi_psk`). See docs/cli.md.
+
 `node` section of the config: `num`, `long_name`, `short_name`, `role` (advertised only), `hw_model`, `private_key` (base64 X25519, stored only in the local config file, redacted in DB and CLI output), `hop_limit`, `duty_cycle_limit`, `duty_cycle_enforce`.
 
 ## License

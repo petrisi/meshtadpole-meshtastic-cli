@@ -84,6 +84,13 @@ pub struct Config {
     /// USB serial of the stick to use; None = first found.
     #[serde(default)]
     pub usb_serial: Option<String>,
+    /// Decoded payload field names replaced with `<redacted>` in output and storage (any nesting level).
+    #[serde(default = "default_redact")]
+    pub redact_fields: Vec<String>,
+}
+
+fn default_redact() -> Vec<String> {
+    crate::decode::DEFAULT_REDACT_FIELDS.iter().map(|s| s.to_string()).collect()
 }
 
 impl Default for Config {
@@ -105,6 +112,7 @@ impl Default for Config {
             channels: vec![ChannelConfig { name: "EdgeFastLow".into(), psk: "AQ==".into() }],
             api: DEFAULT_API.into(),
             usb_serial: None,
+            redact_fields: default_redact(),
         }
     }
 }
