@@ -359,6 +359,111 @@ fn admin_set(sh: &Shared, req: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Firmware RoutingModule::getHopLimitForResponse.
+fn response_hop_limit(h: &crate::packet::Header, ours: u8) -> u8 {
+    if h.hop_start != 0 && h.hop_start >= h.hop_limit {
+        let used = h.hop_start - h.hop_limit;
+        if used > ours {
+            return used;
+        } else if used + 2 < ours {
+            return used + 2;
+        }
+    }
+    ours
+}
+
+/// ACK/NAK for want_ack packets to us (firmware ReliableRouter::sniffReceived) and minimal responders
+/// (NodeInfo, traceroute) for requests to us. Replies go over the channel (firmware never uses PKC for
+/// ROUTING/NODEINFO/TRACEROUTE). Per (from,id) at most once per 5 s.
+fn auto_replies(
+    sh: &Shared,
+    d: &crate::decode::Decoded,
+    f: &sx1262::RxFrame,
+    recent: &mut HashMap<(u32, u32), Instant>,
+) -> Vec<mesh::Outgoing> {
+    let (Some(me), Some(h)) = (sh.me, d.header) else { return vec![] };
+    if h.to != me || h.from == me || d.status == crate::decode::Status::CrcError {
+        return vec![];
+    }
+    recent.retain(|_, t| t.elapsed() < Duration::from_secs(5));
+    if recent.contains_key(&(h.from, h.id)) {
+        return vec![];
+    }
+    let ch_idx = d
+        .channel
+        .as_deref()
+        .and_then(|n| sh.channels.iter().position(|c| c.name == n))
+        .unwrap_or(0);
+    let resp_hops = response_hop_limit(&h, sh.cfg.node.hop_limit);
+    let mk = |port: &str, payload: Vec<u8>, request_id: u32, hop_limit: u8, want_ack: bool| -> Option<mesh::Outgoing> {
+        let req = SendReq {
+            to: h.from,
+            port: port.into(),
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(payload),
+            want_ack,
+            want_response: false,
+            pkc: Some(false),
+            channel: ch_idx,
+            hop_limit: Some(hop_limit),
+            request_id: Some(request_id),
+            wait_s: 0.0,
+            retries: 0,
+        };
+        mesh::build(me, sh.cfg.node.hop_limit, &req, &sh.channels, None).ok()
+    };
+    let routing = |reason: &str| crate::proto::encode_json("Routing", &json!({"error_reason": reason})).unwrap_or_default();
+    let mut out = Vec::new();
+    let data = d.data.as_ref();
+    let has_req_or_reply = data.is_some_and(|x| x.get("request_id").is_some() || x.get("reply_id").is_some());
+    let want_response = data.is_some_and(|x| x["want_response"].as_bool().unwrap_or(false));
+
+    // Responders (a response replaces the ACK, as in firmware).
+    let mut responded = false;
+    if d.status == crate::decode::Status::Ok && want_response {
+        match d.portnum {
+            Some(4) => {
+                let pubk = sh.pkc.as_ref().map(|p| p.read().unwrap().id.public_b64());
+                if let Ok(p) = mesh::user_payload(&sh.cfg, me, pubk) {
+                    out.extend(mk("NODEINFO_APP", p, h.id, resp_hops, false));
+                    responded = true;
+                }
+            }
+            Some(70) => {
+                let mut rd = data.map(|x| x["payload"].clone()).filter(|v| v.is_object()).unwrap_or(json!({}));
+                let snr = (f.snr_db * 4.0).round().clamp(-127.0, 127.0) as i64;
+                let mut s = rd["snr_towards"].as_array().cloned().unwrap_or_default();
+                s.push(json!(snr));
+                rd["snr_towards"] = json!(s);
+                if let Ok(p) = crate::proto::encode_json("RouteDiscovery", &rd) {
+                    out.extend(mk("TRACEROUTE_APP", p, h.id, resp_hops, false));
+                    responded = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if h.want_ack && !responded {
+        match d.status {
+            crate::decode::Status::Ok => {
+                if !has_req_or_reply {
+                    out.extend(mk("ROUTING_APP", routing("NONE"), h.id, resp_hops, false));
+                } else if h.hops_taken() == Some(0) || h.next_hop != 0 {
+                    out.extend(mk("ROUTING_APP", routing("NONE"), h.id, 0, false));
+                }
+            }
+            crate::decode::Status::Pkc => out.extend(mk("ROUTING_APP", routing("PKI_UNKNOWN_PUBKEY"), h.id, resp_hops, false)),
+            crate::decode::Status::NoChannel | crate::decode::Status::DecodeError => {
+                out.extend(mk("ROUTING_APP", routing("NO_CHANNEL"), h.id, resp_hops, false))
+            }
+            _ => {}
+        }
+    }
+    if !out.is_empty() {
+        recent.insert((h.from, h.id), Instant::now());
+    }
+    out
+}
+
 fn load_keys(db: &Path) -> HashMap<u32, [u8; 32]> {
     let mut m = HashMap::new();
     let Ok(c) = store::open_rw(db) else { return m };
@@ -453,6 +558,7 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
     let (mut frames, mut crc, mut hdr, mut air) = (0u32, 0u32, 0u32, 0f64);
     let mut pending: VecDeque<(TxJob, Instant)> = VecDeque::new();
     let mut busy_since: Option<Instant> = None;
+    let mut acked_recent: HashMap<(u32, u32), Instant> = HashMap::new();
 
     let res: Result<()> = (|| {
         while !sh.stop.load(Ordering::SeqCst) {
@@ -495,6 +601,11 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
                     ev["dup_of"] = json!(dup_of);
                     sh.broadcast(&ev);
                     sh.notify_waiters(&ev, d.plaintext.as_ref());
+                    for out in auto_replies(&sh, &d, &f, &mut acked_recent) {
+                        let (dtx, _drx) = channel();
+                        let backoff = Duration::from_millis(100 + rand::random::<u64>() % 300);
+                        pending.push_back((TxJob { out, attempt: 0, done: dtx }, Instant::now() + backoff));
+                    }
                 }
                 Some(sx1262::RxEvent::HeaderError { rssi_inst_dbm, .. }) => {
                     did_rx = true;

@@ -70,6 +70,14 @@ enum Cmd {
         #[command(flatten)]
         w: WaitOpts,
     },
+    /// Request data from a node: telemetry[:VARIANT], position, traceroute, neighbors, nodeinfo.
+    /// Telemetry variants: device (default), local_stats, environment, power, air_quality, health, host.
+    Request {
+        to: String,
+        kind: String,
+        #[command(flatten)]
+        w: WaitOpts,
+    },
     /// Send our NodeInfo (User incl. public key) to a node, requesting theirs.
     Nodeinfo {
         to: String,
@@ -251,6 +259,99 @@ fn pkc_call(cfg: &Config, req: &Value, to: u32, w: WaitOpts) -> Result<Value> {
     Ok(r2)
 }
 
+/// SNR as carried in RouteDiscovery (dB * 4, i8; -128 = unknown).
+fn route_snr(v: &Value) -> Value {
+    match v.as_i64() {
+        Some(-128) | None => Value::Null,
+        Some(x) => json!(x as f64 / 4.0),
+    }
+}
+
+/// Hop list `[{node, snr_db}]`: `start` -> route... -> `end`; snr[i] is measured by the receiver of hop i.
+fn route_hops(start: u32, route: &Value, snrs: &Value, end: u32) -> Value {
+    let mut nodes = vec![start];
+    nodes.extend(route.as_array().into_iter().flatten().filter_map(|x| x.as_u64()).map(|x| x as u32));
+    nodes.push(end);
+    let snr: Vec<Value> = snrs.as_array().map(|a| a.iter().map(route_snr).collect()).unwrap_or_default();
+    json!(nodes
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| json!({"from": packet::node_id(w[0]), "to": packet::node_id(w[1]), "snr_db": snr.get(i).cloned().unwrap_or(Value::Null)}))
+        .collect::<Vec<_>>())
+}
+
+fn request(cfg: &Config, to: u32, kind: &str, w: WaitOpts) -> Result<Value> {
+    let (k, variant) = kind.split_once(':').map(|(a, b)| (a, Some(b))).unwrap_or((kind, None));
+    // Firmware never uses PKC for TRACEROUTE, POSITION, NODEINFO, ROUTING (relays must read traceroutes).
+    let (port, payload, pkc): (&str, Vec<u8>, Option<bool>) = match k {
+        "telemetry" => {
+            let v = match variant.unwrap_or("device") {
+                "device" => "device_metrics",
+                "local_stats" => "local_stats",
+                "environment" => "environment_metrics",
+                "power" => "power_metrics",
+                "air_quality" => "air_quality_metrics",
+                "health" => "health_metrics",
+                "host" => "host_metrics",
+                x => bail!("unknown telemetry variant {x}"),
+            };
+            ("TELEMETRY_APP", proto::encode_json("Telemetry", &json!({ v: {} }))?, None)
+        }
+        "position" => ("POSITION_APP", proto::encode_json("Position", &json!({}))?, Some(false)),
+        "traceroute" => ("TRACEROUTE_APP", proto::encode_json("RouteDiscovery", &json!({}))?, Some(false)),
+        "neighbors" | "neighborinfo" => ("NEIGHBORINFO_APP", proto::encode_json("NeighborInfo", &json!({}))?, Some(false)),
+        "nodeinfo" => return nodeinfo_exchange(cfg, to, w),
+        x => bail!("unknown request kind {x}"),
+    };
+    // PKC requests set want_ack: firmware sends PKI_UNKNOWN_PUBKEY only for want_ack packets.
+    let req = send_req(to, port, &payload, pkc != Some(false), true, pkc, 0, w);
+    let mut r = if pkc == Some(false) { daemon::call(&cfg.api, &req)? } else { pkc_call(cfg, &req, to, w)? };
+    // PKC request with no response and no NAK (NAK lost on multi-hop path): exchange NodeInfo, retry once.
+    if pkc != Some(false)
+        && r["encryption"] == "pkc"
+        && r["responses"].as_array().is_none_or(|a| a.is_empty())
+        && r["nak"].is_null()
+        && r.get("key_exchange").is_none()
+    {
+        let first = r["packet_id"].clone();
+        let ni = nodeinfo_exchange(cfg, to, w)?;
+        r = daemon::call(&cfg.api, &req)?;
+        r["key_exchange"] = json!({"first_packet_id": first, "reason": "no response", "nodeinfo_acked": ni["acked"]});
+    }
+    let resp = r["responses"].as_array().and_then(|a| a.first()).cloned();
+    let mut out = json!({
+        "to": packet::node_id(to), "kind": kind, "packet_id": r["packet_id"], "encryption": r["encryption"],
+        // A node may answer with another module's reply (observed: NEIGHBORINFO_APP to a TELEMETRY_APP request).
+        "ok": resp.as_ref().is_some_and(|e| e["port"] == port),
+        "response_port": resp.as_ref().map(|e| e["port"].clone()),
+        "nak": r["nak"],
+        "key_exchange": r.get("key_exchange"),
+        "transmissions": r["transmissions"].as_array().map(|a| a.len()),
+        "relays_heard": r["relays_heard"],
+        "response": resp.as_ref().map(|e| e["data"]["payload"].clone()),
+        "response_rf": resp.as_ref().map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "hop_start": e["hop_start"], "relay_node": e["relay_node"], "rx_time": e["rx_time"], "frame_id": e["frame_id"]})),
+    });
+    if r["nak"] == "NO_RESPONSE" {
+        out["note"] = json!("node has no handler for this request (module disabled, variant unsupported, or reply throttled: position/neighbors 1 per 3 min)");
+    }
+    if k == "traceroute" {
+        if let Some(e) = &resp {
+            let me = cfg.node.num.unwrap_or(0);
+            let p = &e["data"]["payload"];
+            let mut back_snr = p["snr_back"].clone();
+            // The originator measures the last hop of the return path itself.
+            if let Some(a) = back_snr.as_array_mut() {
+                a.push(json!((e["snr"].as_f64().unwrap_or(0.0) * 4.0).round() as i64));
+            } else {
+                back_snr = json!([(e["snr"].as_f64().unwrap_or(0.0) * 4.0).round() as i64]);
+            }
+            out["forward"] = route_hops(me, &p["route"], &p["snr_towards"], to);
+            out["back"] = route_hops(to, &p["route_back"], &back_snr, me);
+        }
+    }
+    Ok(out)
+}
+
 fn set_path(v: &mut Value, path: &str, val: Value) -> Result<()> {
     let mut cur = v;
     let parts: Vec<&str> = path.split('.').collect();
@@ -368,6 +469,10 @@ fn run(cli: &Cli) -> Result<()> {
             let req = send_req(to, "TEXT_MESSAGE_APP", text.as_bytes(), !no_ack && to != packet::BROADCAST, false, pkc, *channel, *w);
             let r = if to != packet::BROADCAST && !no_pkc { pkc_call(&cfg, &req, to, *w)? } else { daemon::call(&cfg.api, &req)? };
             print(&r);
+        }
+        Cmd::Request { to, kind, w } => {
+            let to = packet::parse_node_id(to).context("bad node id")?;
+            print(&request(&cfg, to, kind, *w)?);
         }
         Cmd::Nodeinfo { to, w } => {
             let to = packet::parse_node_id(to).context("bad node id")?;

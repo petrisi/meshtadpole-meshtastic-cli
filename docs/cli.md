@@ -22,6 +22,7 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 | `config [--write] [--set PATH=VALUE]...` | — | effective config (private key redacted), derived LoRa parameters (freq_hz, bw_hz, sf, cr, sync_word, ldro, channel hashes), paths. `--set` writes the file; value parsed as JSON else string; `node.num` accepts node ids. Restart daemon to apply |
 | `identity` | — | our node num/id, names, role, public key derived from `node.private_key` |
 | `send <TO> <TEXT> [--channel N] [--no-pkc] [--no-ack]` | daemon | send result (below). Unicast uses PKC when the destination key is known |
+| `request <TO> <KIND>` | daemon | request result (see Requests) |
 | `nodeinfo <TO>` | daemon | send our User (incl. public key) over the channel with want_response |
 | `admin <NODE> get <ITEM>...` | daemon | `{node, results[]}`; one admin request per item. Progress lines on stderr |
 | `admin <NODE> raw '<JSON>'` | daemon | arbitrary `meshtastic.AdminMessage` as proto3 JSON |
@@ -108,6 +109,40 @@ ACK means received and decrypted, not applied. Only a read-back proves a write.
 - `responses`: first non-Routing frame with `request_id` = packet_id.
 - `relays_heard`: our packet heard rebroadcast (implicit ACK, relay coverage).
 - Broadcasts complete after `--wait`.
+
+## Requests
+
+`request <TO> telemetry[:VARIANT] | position | traceroute | neighbors | nodeinfo`
+
+Telemetry variants: `device` (default), `local_stats`, `environment`, `power`, `air_quality`, `health`, `host`.
+
+| Kind | Port | Encryption | Notes |
+|---|---|---|---|
+| telemetry | TELEMETRY_APP | PKC if key known, want_ack | variant selected by which Telemetry field the request carries |
+| position | POSITION_APP | channel | firmware replies at most once per 3 min per node |
+| traceroute | TRACEROUTE_APP | channel | relays append themselves and SNR; firmware never uses PKC |
+| neighbors | NEIGHBORINFO_APP | channel | only if NeighborInfo module enabled; 1 reply per 3 min |
+| nodeinfo | NODEINFO_APP | channel | same as `nodeinfo` command |
+
+Result: `to`, `kind`, `packet_id`, `encryption`, `ok`, `response_port`, `nak`, `key_exchange`, `transmissions`, `relays_heard`, `response` (payload), `response_rf` (`rssi`, `snr`, `hops_taken`, `hop_start`, `relay_node`, `rx_time`, `frame_id`), `note`.
+Traceroute adds `forward` and `back`: `[{from, to, snr_db}]` per hop; `snr_db` measured by the receiving node of that hop (last back hop measured by us). Unknown SNR = null.
+
+- `ok` requires `response_port` = requested port. Observed: a node answered TELEMETRY_APP with NEIGHBORINFO_APP (firmware lets the first module that wants the packet reply; NeighborInfo wants all packets).
+- PKC: firmware sends PKI_UNKNOWN_PUBKEY only for want_ack packets, and the NAK can be lost on multi-hop paths. On NAK or on no response at all, the CLI sends our NodeInfo and retries once (`key_exchange`).
+- No response and no NAK: request lost, module disabled, or reply throttled.
+
+## Automatic replies (daemon)
+
+| Received (addressed to us) | Daemon sends |
+|---|---|
+| want_ack, decoded, no request_id/reply_id | ROUTING_APP ACK, hop limit per firmware getHopLimitForResponse |
+| want_ack, decoded reply, received direct or with next_hop set | ROUTING_APP ACK, hop limit 0 |
+| want_ack, PKC from unknown key | NAK PKI_UNKNOWN_PUBKEY |
+| want_ack, no channel / decode error | NAK NO_CHANNEL |
+| NODEINFO_APP with want_response | our User (replaces ACK) |
+| TRACEROUTE_APP with want_response | RouteDiscovery with our SNR appended to snr_towards (replaces ACK) |
+
+All automatic replies use channel encryption, are rate-limited to one per (from, id) per 5 s, and are logged in `tx_frames`. Without ACKs, firmware retransmits want_ack replies (observed up to 4 copies).
 
 ## Transmit policy
 

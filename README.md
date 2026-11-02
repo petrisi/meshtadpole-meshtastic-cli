@@ -57,7 +57,8 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 | TX: text (channel/PKC), NodeInfo exchange, CSMA, duty-cycle guard | working |
 | Remote admin read (owner, metadata, channels, configs, modules) | working (2.7.26) |
 | Remote admin set: read-modify-write, dry run, guards, verify | working (2.7.26: config, security, module, owner, channel) |
-| Requests: telemetry, position, traceroute, neighborinfo | not implemented |
+| Requests: telemetry, position, traceroute, neighborinfo | working |
+| ACK/NAK of packets to us; NodeInfo and traceroute responders | working |
 | AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
 | Linux | untested |
 
