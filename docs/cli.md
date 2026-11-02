@@ -75,11 +75,24 @@ Firmware replaces a whole config section on set. Sequence (daemon `admin_set`):
    - `config:security`: merged `private_key` must be 32 bytes (2.7.x generates a new keypair otherwise); our public key must remain in `admin_key`.
    - `config:security`, `config:lora`, `channel:0` → refused without `--allow-disruptive`.
 5. Without `--apply`: dry run, returns before/after/diff.
-6. `set_*` with passkey, want_ack. Then wait `--verify-delay` and re-read; changed paths compared.
+6. `set_*` with passkey, want_ack + want_response, single transmission, 20 s wait. NAK → stop (`set_nak`). Then wait `--verify-delay` and re-read; changed paths compared. `applied` = `verified`.
 
-Result fields: `node`, `set_field`, `variant`, `disruptive`, `before`, `after`, `diff[{path,before,after}]`, `changed`, `applied`, `dry_run`, `refused`, `set_packet_id`, `set_acked`, `set_nak`, `verified`, `verify_mismatch`, `verify_error`, `identity_preserved` (security only: public and private key unchanged). Secret values appear as `<redacted>`.
+Result fields: `node`, `set_field`, `variant`, `disruptive`, `before`, `after`, `diff[{path,before,after}]`, `changed`, `applied`, `dry_run`, `refused`, `set_packet_id`, `set_nak`, `verified`, `verify_mismatch`, `verify_error`, `identity_preserved` (security only: public and private key unchanged). Secret values appear as `<redacted>`.
 
 Many config writes make the node reboot; increase `--verify-delay` (e.g. 30) accordingly.
+
+`set_owner` (2.7.26) copies only non-empty `long_name`/`short_name`, `is_licensed`, `is_unmessagable`; names cannot be cleared.
+
+### Firmware reply semantics for admin writes (2.7.26, verified)
+
+| Sent with | Accepted | Rejected (e.g. bad passkey) |
+|---|---|---|
+| want_ack | ACK | ACK (admin error discarded) |
+| want_ack + want_response | silence | NAK with reason (`ADMIN_BAD_SESSION_KEY`, `NOT_AUTHORIZED`, ...) |
+
+ACK means received and decrypted, not applied. Only a read-back proves a write.
+
+`admin raw` non-get messages use want_response (result `ok` = no NAK; delivery unconfirmed). `--ack-only` requests an ACK instead (`ok` = ACK; admin errors not reported).
 
 ## Send result
 

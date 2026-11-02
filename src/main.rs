@@ -156,7 +156,13 @@ enum AdminOp {
     Get { items: Vec<String> },
     /// Send an arbitrary AdminMessage given as proto3 JSON, e.g. '{"get_owner_request":true}'.
     /// Non-get messages without session_passkey get one from a fresh `config:sessionkey` read.
-    Raw { json: String },
+    Raw {
+        json: String,
+        /// Non-get messages: request only an ACK (confirms delivery; firmware then discards admin errors).
+        /// Default requests a response: admin errors return as NAK, success is silent.
+        #[arg(long)]
+        ack_only: bool,
+    },
     /// Read-modify-write one item (config:<name>, module:<name>, channel:<n>, owner).
     /// CHANGES is a JSON object merged into the current value (objects merge, arrays replace, null = default).
     /// Dry run unless --apply. Security, lora and channel 0 writes also need --allow-disruptive.
@@ -371,7 +377,7 @@ fn run(cli: &Cli) -> Result<()> {
             let to = packet::parse_node_id(node).context("bad node id")?;
             let items = match op {
                 AdminOp::Get { items } => admin_items(items)?,
-                AdminOp::Raw { json: j } => {
+                AdminOp::Raw { json: j, .. } => {
                     let mut msg: Value = serde_json::from_str(j).context("AdminMessage JSON")?;
                     let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
                     if !is_get && msg.get("session_passkey").is_none() {
@@ -409,12 +415,23 @@ fn run(cli: &Cli) -> Result<()> {
             let mut results = Vec::new();
             for (label, msg) in items {
                 let payload = proto::encode_json("AdminMessage", &msg)?;
-                let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w);
+                // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
+                let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
+                let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
+                let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w);
                 let entry = match r {
                     Ok(r) => {
                         let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
+                        // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
+                        let ok = if is_get {
+                            resp.is_some()
+                        } else if ack_only {
+                            r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
+                        } else {
+                            r["nak"].is_null()
+                        };
                         json!({
-                            "item": label, "ok": resp.is_some(), "response": resp, "nak": r["nak"],
+                            "item": label, "ok": ok, "acked": r["acked"], "response": resp, "nak": r["nak"],
                             "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
                             "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
                             "key_exchange": r.get("key_exchange"),

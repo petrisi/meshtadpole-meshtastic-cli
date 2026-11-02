@@ -325,21 +325,24 @@ fn admin_set(sh: &Shared, req: &Value) -> Result<Value> {
         return Ok(out);
     }
     let set = admin::set_message(&t, &merged, &passkey);
-    let res = do_send(sh, &admin_req(to, &set, false, req)?)?;
+    // want_response: firmware returns admin errors (e.g. ADMIN_BAD_SESSION_KEY) as NAK and stays silent on
+    // success. With want_ack only it ACKs on receipt and discards admin errors. Success is decided by read-back.
+    let mut sreq = admin_req(to, &set, true, req)?;
+    sreq.wait_s = req["set_wait_s"].as_f64().unwrap_or(20.0);
+    sreq.retries = 0;
+    let res = do_send(sh, &sreq)?;
     out["set_packet_id"] = res["packet_id"].clone();
-    out["set_transmissions"] = json!(res["transmissions"].as_array().map(|a| a.len()));
     out["set_nak"] = res["nak"].clone();
-    out["set_acked"] = res["acked"].clone();
     if res["nak"].is_string() {
         return Ok(out);
     }
-    out["applied"] = json!(res["acked"].as_bool().unwrap_or(false));
     std::thread::sleep(Duration::from_secs_f64(verify_delay));
     match admin_get(sh, to, get, req) {
         Ok((_, rb)) => {
             let t2 = admin::target_from_response(&rb)?;
             let bad = admin::verify(&merged, &t2.current, changes);
             out["verified"] = json!(bad.is_empty());
+            out["applied"] = json!(bad.is_empty());
             out["verify_mismatch"] = diff_json(&bad);
             if t.variant.as_deref() == Some("security") {
                 out["identity_preserved"] = json!(
