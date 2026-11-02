@@ -62,6 +62,10 @@ fn redact_fields() -> &'static [String] {
     REDACT_FIELDS.get_or_init(|| DEFAULT_REDACT_FIELDS.iter().map(|s| s.to_string()).collect())
 }
 
+pub fn is_redacted_field(name: &str) -> bool {
+    redact_fields().iter().any(|f| f == name)
+}
+
 pub fn redact(v: &mut Value) {
     match v {
         Value::Object(m) => {
@@ -80,6 +84,11 @@ pub fn redact(v: &mut Value) {
 
 /// Decode `meshtastic.Data` bytes into JSON with the payload expanded per portnum.
 pub fn data_json(plain: &[u8]) -> anyhow::Result<(i32, Value)> {
+    data_json_opt(plain, true)
+}
+
+/// As `data_json`; `redact_secrets = false` keeps secret fields (daemon-internal use only, never stored or output).
+pub fn data_json_opt(plain: &[u8], redact_secrets: bool) -> anyhow::Result<(i32, Value)> {
     let mut v = proto::decode_json("Data", plain)?;
     let portnum = crate::proto::pool()
         .get_message_by_name("meshtastic.Data")
@@ -98,7 +107,9 @@ pub fn data_json(plain: &[u8]) -> anyhow::Result<(i32, Value)> {
         }
         PayloadKind::Message(m) => match proto::decode_json(m, &payload) {
             Ok(mut p) => {
-                redact(&mut p);
+                if redact_secrets {
+                    redact(&mut p);
+                }
                 obj.insert("payload".into(), p);
                 obj.insert("payload_type".into(), Value::String(m.into()));
             }

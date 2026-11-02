@@ -25,6 +25,7 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 | `nodeinfo <TO>` | daemon | send our User (incl. public key) over the channel with want_response |
 | `admin <NODE> get <ITEM>...` | daemon | `{node, results[]}`; one admin request per item. Progress lines on stderr |
 | `admin <NODE> raw '<JSON>'` | daemon | arbitrary `meshtastic.AdminMessage` as proto3 JSON |
+| `admin <NODE> set <ITEM> '<CHANGES>' [--apply] [--allow-disruptive]` | daemon | read-modify-write result (see Admin writes) |
 | `daemon` | radio | foreground; lifecycle events as NDJSON on stderr. Stops on Ctrl+C |
 | `status` | daemon | pid, session_id, usb_serial, radio parameters, frames received |
 | `listen [--ok-only] [--seconds N]` | daemon | NDJSON frame events (below) |
@@ -50,7 +51,7 @@ Module names: mqtt serial extnotif storeforward rangetest telemetry cannedmsg au
 
 Admin requests are PKC-encrypted with `node.private_key`; the target must list our public key in `security.admin_key`. On NAK `PKI_UNKNOWN_PUBKEY` the CLI sends our NodeInfo and retries once (`key_exchange` in result). Firmware 2.7.26 required this.
 
-Responses include `session_passkey`; set operations must echo it within 300 s (not yet exposed).
+Responses include `session_passkey`; set operations must echo it within 300 s. `admin raw` with a non-get message and no `session_passkey` first reads `config:sessionkey` to obtain one.
 
 ## Redaction
 
@@ -58,7 +59,27 @@ Config `redact_fields` (default `["private_key","wifi_psk"]`): decoded payload f
 
 - Set: `config --set 'redact_fields=["private_key","wifi_psk","fixed_pin"]'`. Restart daemon to apply.
 - Not covered: `rx_frames.raw` (encrypted frame; decryptable with `node.private_key`), rows stored before a field was added.
-- Admin writes do not yet exist; handling of redacted values in writes is unspecified.
+- Writes never take secret values from the caller; see Admin writes.
+
+## Admin writes
+
+`admin <NODE> set <ITEM> '<CHANGES>' [--apply] [--allow-disruptive] [--verify-delay S]`
+
+Firmware replaces a whole config section on set. Sequence (daemon `admin_set`):
+
+1. Fresh get of ITEM; unredacted value and `session_passkey` held in daemon memory only.
+2. CHANGES merged: objects merge recursively, arrays and scalars replace, `null` resets to default.
+3. Diff computed (proto3 defaults and absent fields are equal). No diff → nothing sent.
+4. Guards:
+   - CHANGES containing `<redacted>` → error.
+   - `config:security`: merged `private_key` must be 32 bytes (2.7.x generates a new keypair otherwise); our public key must remain in `admin_key`.
+   - `config:security`, `config:lora`, `channel:0` → refused without `--allow-disruptive`.
+5. Without `--apply`: dry run, returns before/after/diff.
+6. `set_*` with passkey, want_ack. Then wait `--verify-delay` and re-read; changed paths compared.
+
+Result fields: `node`, `set_field`, `variant`, `disruptive`, `before`, `after`, `diff[{path,before,after}]`, `changed`, `applied`, `dry_run`, `refused`, `set_packet_id`, `set_acked`, `set_nak`, `verified`, `verify_mismatch`, `verify_error`, `identity_preserved` (security only: public and private key unchanged). Secret values appear as `<redacted>`.
+
+Many config writes make the node reboot; increase `--verify-delay` (e.g. 30) accordingly.
 
 ## Send result
 

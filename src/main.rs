@@ -1,3 +1,4 @@
+mod admin;
 mod channel;
 mod config;
 mod daemon;
@@ -154,7 +155,24 @@ enum AdminOp {
     /// neighborinfo ambientlighting detectionsensor paxcounter statusmessage trafficmanagement tak meshbeacon.
     Get { items: Vec<String> },
     /// Send an arbitrary AdminMessage given as proto3 JSON, e.g. '{"get_owner_request":true}'.
+    /// Non-get messages without session_passkey get one from a fresh `config:sessionkey` read.
     Raw { json: String },
+    /// Read-modify-write one item (config:<name>, module:<name>, channel:<n>, owner).
+    /// CHANGES is a JSON object merged into the current value (objects merge, arrays replace, null = default).
+    /// Dry run unless --apply. Security, lora and channel 0 writes also need --allow-disruptive.
+    Set {
+        item: String,
+        changes: String,
+        /// Transmit the write. Without it: read, merge, diff only.
+        #[arg(long)]
+        apply: bool,
+        /// Permit writes to security, lora, channel 0.
+        #[arg(long)]
+        allow_disruptive: bool,
+        /// Seconds between write ACK and verification read.
+        #[arg(long, default_value_t = 10.0)]
+        verify_delay: f64,
+    },
 }
 
 const CONFIG_TYPES: &[&str] = &["device", "position", "power", "network", "display", "lora", "bluetooth", "security", "sessionkey", "deviceui"];
@@ -353,7 +371,40 @@ fn run(cli: &Cli) -> Result<()> {
             let to = packet::parse_node_id(node).context("bad node id")?;
             let items = match op {
                 AdminOp::Get { items } => admin_items(items)?,
-                AdminOp::Raw { json: j } => vec![("raw".into(), serde_json::from_str(j).context("AdminMessage JSON")?)],
+                AdminOp::Raw { json: j } => {
+                    let mut msg: Value = serde_json::from_str(j).context("AdminMessage JSON")?;
+                    let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
+                    if !is_get && msg.get("session_passkey").is_none() {
+                        let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
+                        let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
+                        let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
+                            .as_str()
+                            .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
+                        msg["session_passkey"] = json!(pk);
+                    }
+                    vec![("raw".into(), msg)]
+                }
+                AdminOp::Set { item, changes, apply, allow_disruptive, verify_delay } => {
+                    let items = admin_items(std::slice::from_ref(item))?;
+                    if items.len() != 1 {
+                        bail!("set takes exactly one item");
+                    }
+                    let changes: Value = serde_json::from_str(changes).context("CHANGES JSON")?;
+                    let req = json!({
+                        "cmd": "admin_set", "to": to, "get": items[0].1, "changes": changes,
+                        "apply": apply, "allow_disruptive": allow_disruptive, "verify_delay_s": verify_delay,
+                        "wait_s": w.wait, "retries": w.retries, "hop_limit": w.hop_limit,
+                    });
+                    let r = match daemon::call(&cfg.api, &req) {
+                        Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
+                            nodeinfo_exchange(&cfg, to, *w)?;
+                            daemon::call(&cfg.api, &req)?
+                        }
+                        r => r?,
+                    };
+                    print(&r);
+                    return Ok(());
+                }
             };
             let mut results = Vec::new();
             for (label, msg) in items {

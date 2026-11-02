@@ -31,7 +31,8 @@ struct TxJob {
 
 struct Waiter {
     id: u32,
-    tx: Sender<Value>,
+    /// Frame event plus decrypted `Data` bytes (daemon-internal; never sent to clients).
+    tx: Sender<(Value, Option<Vec<u8>>)>,
 }
 
 struct Shared {
@@ -56,13 +57,13 @@ impl Shared {
         self.subscribers.lock().unwrap().retain_mut(|s| s.write_all(line.as_bytes()).is_ok());
     }
 
-    fn notify_waiters(&self, ev: &Value) {
+    fn notify_waiters(&self, ev: &Value, plain: Option<&Vec<u8>>) {
         let req = ev["data"]["request_id"].as_u64().map(|x| x as u32);
         let pid = ev["id"].as_u64().map(|x| x as u32);
         let from_me = self.me.is_some_and(|m| ev["from"] == json!(crate::packet::node_id(m)));
         self.waiters.lock().unwrap().retain(|w| {
             if req == Some(w.id) || (from_me && pid == Some(w.id)) {
-                w.tx.send(ev.clone()).is_ok()
+                w.tx.send((ev.clone(), plain.cloned())).is_ok()
             } else {
                 true
             }
@@ -129,6 +130,19 @@ fn handle_client(stream: TcpStream, sh: Arc<Shared>) -> Result<()> {
                 }
                 writeln!(w, "{out}")?;
             }
+            Some("admin_set") => {
+                let out = match admin_set(&sh, &req) {
+                    Ok(v) => v,
+                    Err(e) => json!({"error": format!("{e:#}")}),
+                };
+                if let Ok(c) = store::open_rw(&sh.db) {
+                    let _ = c.execute(
+                        "INSERT INTO requests(t,request_json,result_json) VALUES(?1,?2,?3)",
+                        rusqlite::params![store::now(), req.to_string(), out.to_string()],
+                    );
+                }
+                writeln!(w, "{out}")?;
+            }
             other => writeln!(w, "{}", json!({"error": format!("unknown cmd {other:?}")}))?,
         }
     }
@@ -137,13 +151,19 @@ fn handle_client(stream: TcpStream, sh: Arc<Shared>) -> Result<()> {
 
 /// Transmit, retransmit if nothing heard, collect ack/responses/relay echoes.
 fn do_send(sh: &Shared, req: &SendReq) -> Result<Value> {
+    do_send_full(sh, req).map(|(v, _)| v)
+}
+
+/// As `do_send`, also returning decrypted `Data` bytes of each response (same order as `responses`).
+fn do_send_full(sh: &Shared, req: &SendReq) -> Result<(Value, Vec<Vec<u8>>)> {
     let me = sh.me.ok_or_else(|| anyhow!("node.num not set in config"))?;
     let out = {
         let pk = sh.pkc.as_ref().map(|l| l.read().unwrap());
         mesh::build(me, sh.cfg.node.hop_limit, req, &sh.channels, pk.as_deref())?
     };
     let id = out.header.id;
-    let (etx, erx) = channel::<Value>();
+    let (etx, erx) = channel::<(Value, Option<Vec<u8>>)>();
+    let mut plains = Vec::new();
     sh.waiters.lock().unwrap().push(Waiter { id, tx: etx });
     let mut txs = Vec::new();
     let mut acks = Vec::new();
@@ -159,7 +179,7 @@ fn do_send(sh: &Shared, req: &SendReq) -> Result<Value> {
         let deadline = Instant::now() + Duration::from_secs_f64(req.wait_s);
         let mut heard_anything = false;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            let Ok(ev) = erx.recv_timeout(left) else { break };
+            let Ok((ev, plain)) = erx.recv_timeout(left) else { break };
             heard_anything = true;
             if ev["from"] == json!(crate::packet::node_id(me)) && ev["id"].as_u64() == Some(id as u64) {
                 relays.push(json!({"relay_node": ev["relay_node"], "hop_limit": ev["hop_limit"], "rssi": ev["rssi"], "snr": ev["snr"], "rx_time": ev["rx_time"], "frame_id": ev["frame_id"]}));
@@ -188,6 +208,7 @@ fn do_send(sh: &Shared, req: &SendReq) -> Result<Value> {
                 }
             }
             responses.push(ev);
+            plains.push(plain.unwrap_or_default());
             finished = true;
             break;
         }
@@ -196,7 +217,7 @@ fn do_send(sh: &Shared, req: &SendReq) -> Result<Value> {
         }
     }
     sh.waiters.lock().unwrap().retain(|w| w.id != id);
-    Ok(json!({
+    Ok((json!({
         "packet_id": id,
         "to": crate::packet::node_id(out.header.to),
         "port": crate::proto::port_name(out.portnum),
@@ -208,7 +229,131 @@ fn do_send(sh: &Shared, req: &SendReq) -> Result<Value> {
         "responses": responses,
         "relays_heard": relays,
         "complete": finished,
-    }))
+    }), plains))
+}
+
+fn admin_req(to: u32, msg: &Value, want_response: bool, base: &Value) -> Result<SendReq> {
+    Ok(SendReq {
+        to,
+        port: "ADMIN_APP".into(),
+        payload_b64: base64::engine::general_purpose::STANDARD.encode(crate::proto::encode_json("AdminMessage", msg)?),
+        want_ack: true,
+        want_response,
+        pkc: Some(true),
+        channel: 0,
+        hop_limit: base["hop_limit"].as_u64().map(|x| x as u8),
+        request_id: None,
+        wait_s: base["wait_s"].as_f64().unwrap_or(60.0),
+        retries: base["retries"].as_u64().unwrap_or(1) as u32,
+    })
+}
+
+/// Admin get; returns (send result, unredacted AdminMessage payload). Daemon-internal.
+fn admin_get(sh: &Shared, to: u32, get: &Value, base: &Value) -> Result<(Value, Value)> {
+    let (res, plains) = do_send_full(sh, &admin_req(to, get, true, base)?)?;
+    if let Some(n) = res["nak"].as_str() {
+        bail!("admin get NAK {n}");
+    }
+    let plain = plains.first().ok_or_else(|| anyhow!("admin get: no response from {}", crate::packet::node_id(to)))?;
+    let (_, data) = crate::decode::data_json_opt(plain, false)?;
+    Ok((res, data["payload"].clone()))
+}
+
+fn redacted_copy(v: &Value) -> Value {
+    let mut c = v.clone();
+    crate::decode::redact(&mut c);
+    c
+}
+
+fn diff_json(d: &[(String, Value, Value)]) -> Value {
+    let secret = |p: &str| crate::decode::is_redacted_field(p.rsplit('.').next().unwrap_or(p));
+    json!(d
+        .iter()
+        .map(|(p, b, a)| if secret(p) {
+            json!({"path": p, "before": crate::admin::REDACTED, "after": crate::admin::REDACTED})
+        } else {
+            json!({"path": p, "before": redacted_copy(b), "after": redacted_copy(a)})
+        })
+        .collect::<Vec<_>>())
+}
+
+/// Read-modify-write of one admin item. See docs/cli.md "Admin writes".
+fn admin_set(sh: &Shared, req: &Value) -> Result<Value> {
+    use crate::admin;
+    let to = req["to"].as_u64().ok_or_else(|| anyhow!("to required"))? as u32;
+    let get = &req["get"];
+    let changes = &req["changes"];
+    let apply = req["apply"].as_bool().unwrap_or(false);
+    let allow_disruptive = req["allow_disruptive"].as_bool().unwrap_or(false);
+    let verify_delay = req["verify_delay_s"].as_f64().unwrap_or(10.0);
+    if !changes.is_object() {
+        bail!("changes must be a JSON object");
+    }
+    if admin::contains_redacted(changes) {
+        bail!("changes contain \"{}\"; secret values cannot be written through redacted output", admin::REDACTED);
+    }
+    let (_, resp) = admin_get(sh, to, get, req)?;
+    let passkey = resp["session_passkey"].as_str().ok_or_else(|| anyhow!("response has no session_passkey"))?.to_string();
+    let t = admin::target_from_response(&resp)?;
+    let merged = admin::merge(&t.current, changes);
+    let d = admin::diff(&t.current, &merged);
+    let disruptive = admin::is_disruptive(&t);
+    let mut out = json!({
+        "node": crate::packet::node_id(to),
+        "set_field": t.set_field, "variant": t.variant,
+        "disruptive": disruptive,
+        "before": redacted_copy(&t.current),
+        "after": redacted_copy(&merged),
+        "diff": diff_json(&d),
+        "changed": !d.is_empty(),
+        "applied": false,
+    });
+    if d.is_empty() {
+        out["note"] = json!("no change; nothing sent");
+        return Ok(out);
+    }
+    if t.variant.as_deref() == Some("security") {
+        let ours = sh.pkc.as_ref().ok_or_else(|| anyhow!("no identity"))?.read().unwrap().id.public_b64();
+        admin::check_security(&merged, &ours)?;
+    }
+    if disruptive && !allow_disruptive {
+        out["refused"] = json!("disruptive change (security, lora, or channel 0) requires allow_disruptive");
+        return Ok(out);
+    }
+    if !apply {
+        out["dry_run"] = json!(true);
+        return Ok(out);
+    }
+    let set = admin::set_message(&t, &merged, &passkey);
+    let res = do_send(sh, &admin_req(to, &set, false, req)?)?;
+    out["set_packet_id"] = res["packet_id"].clone();
+    out["set_transmissions"] = json!(res["transmissions"].as_array().map(|a| a.len()));
+    out["set_nak"] = res["nak"].clone();
+    out["set_acked"] = res["acked"].clone();
+    if res["nak"].is_string() {
+        return Ok(out);
+    }
+    out["applied"] = json!(res["acked"].as_bool().unwrap_or(false));
+    std::thread::sleep(Duration::from_secs_f64(verify_delay));
+    match admin_get(sh, to, get, req) {
+        Ok((_, rb)) => {
+            let t2 = admin::target_from_response(&rb)?;
+            let bad = admin::verify(&merged, &t2.current, changes);
+            out["verified"] = json!(bad.is_empty());
+            out["verify_mismatch"] = diff_json(&bad);
+            if t.variant.as_deref() == Some("security") {
+                out["identity_preserved"] = json!(
+                    t2.current.get("public_key") == t.current.get("public_key")
+                        && t2.current.get("private_key") == t.current.get("private_key")
+                );
+            }
+        }
+        Err(e) => {
+            out["verified"] = Value::Null;
+            out["verify_error"] = json!(format!("{e:#}"));
+        }
+    }
+    Ok(out)
 }
 
 fn load_keys(db: &Path) -> HashMap<u32, [u8; 32]> {
@@ -346,7 +491,7 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
                     ev["airtime_ms"] = json!((airtime * 10.0).round() / 10.0);
                     ev["dup_of"] = json!(dup_of);
                     sh.broadcast(&ev);
-                    sh.notify_waiters(&ev);
+                    sh.notify_waiters(&ev, d.plaintext.as_ref());
                 }
                 Some(sx1262::RxEvent::HeaderError { rssi_inst_dbm, .. }) => {
                     did_rx = true;
