@@ -26,6 +26,10 @@ aes = "0.8"
 ctr = "0.9"
 dirs = "5"
 ctrlc = "3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+ccm = "0.5"
+rand = "0.8"
 
 [build-dependencies]
 prost = "0.13"

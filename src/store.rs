@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -67,6 +67,25 @@ CREATE TABLE IF NOT EXISTS radio_stats(
   frames INTEGER, crc_errors INTEGER, header_errors INTEGER, rx_airtime_ms REAL
 );
 CREATE INDEX IF NOT EXISTS radio_stats_time ON radio_stats(t_start);
+
+CREATE TABLE IF NOT EXISTS tx_frames(
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER,
+  tx_time REAL NOT NULL,
+  raw BLOB, len INTEGER, airtime_ms REAL,
+  pkt_to INTEGER, pkt_id INTEGER, hop_limit INTEGER, want_ack INTEGER, channel_hash INTEGER,
+  encryption TEXT, portnum INTEGER, port TEXT, data_json TEXT,
+  attempt INTEGER, error TEXT
+);
+CREATE INDEX IF NOT EXISTS tx_frames_time ON tx_frames(tx_time);
+CREATE INDEX IF NOT EXISTS tx_frames_id ON tx_frames(pkt_id);
+
+CREATE TABLE IF NOT EXISTS requests(
+  id INTEGER PRIMARY KEY,
+  t REAL NOT NULL,
+  request_json TEXT,
+  result_json TEXT
+);
 
 CREATE VIEW IF NOT EXISTS v_packets AS
 SELECT id, rx_time, datetime(rx_time,'unixepoch') AS rx_utc, status,
@@ -288,6 +307,22 @@ impl Writer {
             _ => {}
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_tx(
+        &self, t: f64, raw: &[u8], airtime_ms: f64, h: &crate::packet::Header, encryption: &str, portnum: i32,
+        data: &Value, attempt: u32, error: Option<&str>,
+    ) -> Result<i64> {
+        self.c.execute(
+            "INSERT INTO tx_frames(session_id,tx_time,raw,len,airtime_ms,pkt_to,pkt_id,hop_limit,want_ack,channel_hash,encryption,portnum,port,data_json,attempt,error)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                self.session_id, t, raw, raw.len(), airtime_ms, h.to, h.id, h.hop_limit, h.want_ack, h.channel_hash,
+                encryption, portnum, crate::proto::port_name(portnum), data.to_string(), attempt, error
+            ],
+        )?;
+        Ok(self.c.last_insert_rowid())
     }
 
     #[allow(clippy::too_many_arguments)]

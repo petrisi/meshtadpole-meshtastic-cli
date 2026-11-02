@@ -30,8 +30,44 @@ pub struct RadioConfig {
     pub rx_boosted_gain: bool,
 }
 
+/// Our node identity on the mesh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Node number. Required for TX.
+    pub num: Option<u32>,
+    pub long_name: String,
+    pub short_name: String,
+    /// `Config.DeviceConfig.Role` name advertised in NodeInfo. This tool never rebroadcasts.
+    pub role: String,
+    /// `HardwareModel` name advertised in NodeInfo.
+    pub hw_model: String,
+    /// Base64 X25519 private key. Required for PKC (DMs, admin).
+    pub private_key: Option<String>,
+    /// Hop limit for packets we originate.
+    pub hop_limit: u8,
+    /// Max fraction of airtime we may transmit over a rolling hour (EU868 sub-band: 0.10).
+    pub duty_cycle_limit: f64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig {
+            num: None,
+            long_name: "meshtadpole".into(),
+            short_name: "tadp".into(),
+            role: "CLIENT_HIDDEN".into(),
+            hw_model: "PORTDUINO".into(),
+            private_key: None,
+            hop_limit: 3,
+            duty_cycle_limit: 0.10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub node: NodeConfig,
     pub radio: RadioConfig,
     /// Channel 0 is primary. Received packets are matched against all by hash.
     pub channels: Vec<ChannelConfig>,
@@ -46,6 +82,7 @@ impl Default for Config {
     /// EdgeFastLow (meshpirkanmaa.org).
     fn default() -> Self {
         Config {
+            node: NodeConfig::default(),
             radio: RadioConfig {
                 region: "EU_868".into(),
                 bandwidth_khz: 62.5,

@@ -84,7 +84,14 @@ pub fn data_json(plain: &[u8]) -> anyhow::Result<(i32, Value)> {
     Ok((portnum, v))
 }
 
-pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel]) -> Decoded {
+/// Keys for PKC decryption: our identity and known node public keys.
+pub struct PkcCtx {
+    pub me: u32,
+    pub id: crate::pkc::Identity,
+    pub keys: std::collections::HashMap<u32, [u8; 32]>,
+}
+
+pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Option<&PkcCtx>) -> Decoded {
     if crc_error {
         return Decoded::bare(Status::CrcError, Header::parse(raw));
     }
@@ -92,6 +99,41 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel]) -> Decode
         return Decoded::bare(Status::Short, None);
     };
     let enc = &raw[HEADER_LEN..];
+    // PKC: unicast, hash 0, to us (or from us, heard as rebroadcast).
+    if let Some(ctx) = pkc {
+        if h.channel_hash == 0 && h.to != crate::packet::BROADCAST && enc.len() > crate::pkc::OVERHEAD {
+            let peer = if h.to == ctx.me { Some(h.from) } else if h.from == ctx.me { Some(h.to) } else { None };
+            if let Some(peer) = peer {
+                let Some(pk) = ctx.keys.get(&peer) else {
+                    let mut d = Decoded::bare(Status::Pkc, Some(h));
+                    d.error = Some(format!("no public key for {}", crate::packet::node_id(peer)));
+                    return d;
+                };
+                let shared = ctx.id.shared(pk);
+                match crate::pkc::decrypt(&shared, h.from, h.id, enc).map_err(anyhow::Error::from).and_then(|p| {
+                    data_json(&p).map(|x| (x, p))
+                }) {
+                    Ok(((portnum, data), plain)) => {
+                        return Decoded {
+                            status: Status::Ok,
+                            header: Some(h),
+                            channel: Some("PKC".into()),
+                            portnum: Some(portnum),
+                            port: proto::port_name(portnum),
+                            data: Some(data),
+                            plaintext: Some(plain),
+                            error: None,
+                        };
+                    }
+                    Err(e) => {
+                        let mut d = Decoded::bare(Status::DecodeError, Some(h));
+                        d.error = Some(format!("pkc: {e:#}"));
+                        return d;
+                    }
+                }
+            }
+        }
+    }
     let mut last_err = None;
     let mut matched = false;
     for ch in channels.iter().filter(|c| c.hash == h.channel_hash) {
