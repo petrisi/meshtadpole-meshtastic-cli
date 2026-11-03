@@ -2,8 +2,8 @@
 
 use crate::decode::{Decoded, Status};
 use anyhow::{Result, anyhow};
-use meshtadpole_radio::sx1262::RxFrame;
 use meshtadpole_radio::store::Session;
+use meshtadpole_radio::sx1262::RxFrame;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::path::Path;
@@ -100,8 +100,12 @@ pub use meshtadpole_radio::store::{COMMON_SCHEMA, now};
 
 /// Full DDL (common tables from meshtadpole-radio + tool tables).
 pub fn full_schema() -> String {
-    format!("{}
-{}", COMMON_SCHEMA.trim(), SCHEMA.trim())
+    format!(
+        "{}
+{}",
+        COMMON_SCHEMA.trim(),
+        SCHEMA.trim()
+    )
 }
 
 pub fn open_rw(path: &Path) -> Result<Connection> {
@@ -160,11 +164,33 @@ impl Writer {
                channel,portnum,port,data_json,error,dup_of)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
-                self.session_id, t, f.data, f.data.len(), airtime_ms, f.rssi_dbm, f.snr_db, f.signal_rssi_dbm, f.freq_error_hz, status,
-                h.map(|h| h.to), h.map(|h| h.from), h.map(|h| h.id), h.map(|h| h.hop_limit), h.map(|h| h.hop_start),
-                h.and_then(|h| h.hops_taken()), h.map(|h| h.want_ack), h.map(|h| h.via_mqtt), h.map(|h| h.channel_hash),
-                h.map(|h| h.next_hop), h.map(|h| h.relay_node),
-                d.channel, d.portnum, d.port, d.data.as_ref().map(|v| v.to_string()), d.error, dup_of
+                self.session_id,
+                t,
+                f.data,
+                f.data.len(),
+                airtime_ms,
+                f.rssi_dbm,
+                f.snr_db,
+                f.signal_rssi_dbm,
+                f.freq_error_hz,
+                status,
+                h.map(|h| h.to),
+                h.map(|h| h.from),
+                h.map(|h| h.id),
+                h.map(|h| h.hop_limit),
+                h.map(|h| h.hop_start),
+                h.and_then(|h| h.hops_taken()),
+                h.map(|h| h.want_ack),
+                h.map(|h| h.via_mqtt),
+                h.map(|h| h.channel_hash),
+                h.map(|h| h.next_hop),
+                h.map(|h| h.relay_node),
+                d.channel,
+                d.portnum,
+                d.port,
+                d.data.as_ref().map(|v| v.to_string()),
+                d.error,
+                dup_of
             ],
         )?;
         let id = self.s.c.last_insert_rowid();
@@ -208,8 +234,11 @@ impl Writer {
                 self.s.c.execute(
                     "UPDATE nodes SET position_json=?2,position_time=?3,latitude=?4,longitude=?5,altitude=?6 WHERE num=?1",
                     params![
-                        h.from, p.to_string(), t,
-                        p["latitude_i"].as_f64().map(|x| x * 1e-7), p["longitude_i"].as_f64().map(|x| x * 1e-7),
+                        h.from,
+                        p.to_string(),
+                        t,
+                        p["latitude_i"].as_f64().map(|x| x * 1e-7),
+                        p["longitude_i"].as_f64().map(|x| x * 1e-7),
                         p["altitude"].as_i64()
                     ],
                 )?;
@@ -231,8 +260,16 @@ impl Writer {
 
     #[allow(clippy::too_many_arguments)]
     pub fn insert_tx(
-        &self, t: f64, raw: &[u8], airtime_ms: f64, h: &crate::packet::Header, encryption: &str, portnum: i32,
-        data: &Value, attempt: u32, error: Option<&str>,
+        &self,
+        t: f64,
+        raw: &[u8],
+        airtime_ms: f64,
+        h: &crate::packet::Header,
+        encryption: &str,
+        portnum: i32,
+        data: &Value,
+        attempt: u32,
+        error: Option<&str>,
     ) -> Result<i64> {
         self.s.c.execute(
             "INSERT INTO tx_frames(session_id,tx_time,raw,len,airtime_ms,pkt_to,pkt_id,hop_limit,want_ack,channel_hash,encryption,portnum,port,data_json,attempt,error)

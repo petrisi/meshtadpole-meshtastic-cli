@@ -199,10 +199,26 @@ enum AdminOp {
     },
 }
 
-const CONFIG_TYPES: &[&str] = &["device", "position", "power", "network", "display", "lora", "bluetooth", "security", "sessionkey", "deviceui"];
+const CONFIG_TYPES: &[&str] =
+    &["device", "position", "power", "network", "display", "lora", "bluetooth", "security", "sessionkey", "deviceui"];
 const MODULE_TYPES: &[&str] = &[
-    "mqtt", "serial", "extnotif", "storeforward", "rangetest", "telemetry", "cannedmsg", "audio", "remotehardware",
-    "neighborinfo", "ambientlighting", "detectionsensor", "paxcounter", "statusmessage", "trafficmanagement", "tak", "meshbeacon",
+    "mqtt",
+    "serial",
+    "extnotif",
+    "storeforward",
+    "rangetest",
+    "telemetry",
+    "cannedmsg",
+    "audio",
+    "remotehardware",
+    "neighborinfo",
+    "ambientlighting",
+    "detectionsensor",
+    "paxcounter",
+    "statusmessage",
+    "trafficmanagement",
+    "tak",
+    "meshbeacon",
 ];
 
 /// Expand admin get item names into (label, AdminMessage JSON).
@@ -261,7 +277,9 @@ fn admin_items(items: &[String]) -> Result<Vec<(String, Value)>> {
         match it.as_str() {
             "owner" => out.push((it.clone(), json!({"get_owner_request": true}))),
             "metadata" => out.push((it.clone(), json!({"get_device_metadata_request": true}))),
-            "configs" => out.extend(admin_items(&CONFIG_TYPES.iter().filter(|c| **c != "sessionkey").map(|c| format!("config:{c}")).collect::<Vec<_>>())?),
+            "configs" => out.extend(admin_items(
+                &CONFIG_TYPES.iter().filter(|c| **c != "sessionkey").map(|c| format!("config:{c}")).collect::<Vec<_>>(),
+            )?),
             "modules" => out.extend(admin_items(&MODULE_TYPES.iter().map(|c| format!("module:{c}")).collect::<Vec<_>>())?),
             "channels" => out.extend(admin_items(&(0..8).map(|i| format!("channel:{i}")).collect::<Vec<_>>())?),
             "all" => out.extend(admin_items(&["owner", "metadata", "channels", "configs", "modules"].map(String::from))?),
@@ -289,7 +307,16 @@ fn admin_items(items: &[String]) -> Result<Vec<(String, Value)>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn send_req(to: u32, port: &str, payload: &[u8], want_ack: bool, want_response: bool, pkc: Option<bool>, channel: usize, w: WaitOpts) -> Value {
+fn send_req(
+    to: u32,
+    port: &str,
+    payload: &[u8],
+    want_ack: bool,
+    want_response: bool,
+    pkc: Option<bool>,
+    channel: usize,
+    w: WaitOpts,
+) -> Value {
     json!({
         "cmd": "send", "to": to, "port": port,
         "payload_b64": base64::engine::general_purpose::STANDARD.encode(payload),
@@ -300,96 +327,96 @@ fn send_req(to: u32, port: &str, payload: &[u8], want_ack: bool, want_response: 
 
 /// One admin operation against one target.
 fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: &WaitOpts) -> Result<Value> {
-        let items = match op {
-            AdminOp::Get { items } => admin_items(items)?,
-            AdminOp::Raw { .. } | AdminOp::Ignore { .. } | AdminOp::Unignore { .. } => {
-                let mut msg: Value = match op {
-                    AdminOp::Raw { json: j, .. } => serde_json::from_str(j).context("AdminMessage JSON")?,
-                    AdminOp::Ignore { node } => ignore_msg(db_path, node)?,
-                    AdminOp::Unignore { node } => {
-                        json!({"remove_ignored_node": packet::parse_node_id(node).context("bad node id")?})
-                    }
-                    _ => unreachable!(),
-                };
-                let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
-                if !is_get && msg.get("session_passkey").is_none() {
-                    if let Ok(c) = daemon::call(&cfg.api, &json!({"cmd": "passkey", "to": to})) {
-                        if let Some(pk) = c["passkey"].as_str() {
-                            msg["session_passkey"] = json!(pk);
-                        }
-                    }
+    let items = match op {
+        AdminOp::Get { items } => admin_items(items)?,
+        AdminOp::Raw { .. } | AdminOp::Ignore { .. } | AdminOp::Unignore { .. } => {
+            let mut msg: Value = match op {
+                AdminOp::Raw { json: j, .. } => serde_json::from_str(j).context("AdminMessage JSON")?,
+                AdminOp::Ignore { node } => ignore_msg(db_path, node)?,
+                AdminOp::Unignore { node } => {
+                    json!({"remove_ignored_node": packet::parse_node_id(node).context("bad node id")?})
                 }
-                if !is_get && msg.get("session_passkey").is_none() {
-                    let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
-                    let r = pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
-                    let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
-                        .as_str()
-                        .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
-                    msg["session_passkey"] = json!(pk);
-                }
-                vec![(op_label(op), msg)]
-            }
-            AdminOp::Set { item, changes, apply, allow_disruptive, verify_delay } => {
-                let items = admin_items(std::slice::from_ref(item))?;
-                if items.len() != 1 {
-                    bail!("set takes exactly one item");
-                }
-                let changes: Value = serde_json::from_str(changes).context("CHANGES JSON")?;
-                let req = json!({
-                    "cmd": "admin_set", "to": to, "get": items[0].1, "changes": changes,
-                    "apply": apply, "allow_disruptive": allow_disruptive, "verify_delay_s": verify_delay,
-                    "wait_s": w.wait, "retries": w.retries, "hop_limit": w.hop_limit,
-                });
-                let r = match daemon::call(&cfg.api, &req) {
-                    Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
-                        nodeinfo_exchange(cfg, to, *w)?;
-                        daemon::call(&cfg.api, &req)?
-                    }
-                    r => r?,
-                };
-                return Ok(r);
-            }
-        };
-        let mut results = Vec::new();
-        for (label, msg) in items {
-            let payload = proto::encode_json("AdminMessage", &msg)?;
-            // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
-            let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
-            let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
-            let fire = w.no_wait && !is_get;
-            let r = if fire {
-                let wf = WaitOpts { wait: 0.0, retries: 0, ..*w };
-                daemon::call(&cfg.api, &send_req(to, "ADMIN_APP", &payload, false, false, Some(true), 0, wf))
-            } else {
-                pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w)
+                _ => unreachable!(),
             };
-            let entry = match r {
-                Ok(r) => {
-                    let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
-                    // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
-                    let ok = if fire {
-                        r["transmissions"].as_array().is_some_and(|a| !a.is_empty())
-                    } else if is_get {
-                        resp.is_some()
-                    } else if ack_only {
-                        r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
-                    } else {
-                        r["nak"].is_null()
-                    };
-                    json!({
-                        "item": label, "ok": ok, "fire_and_forget": fire, "acked": r["acked"], "response": resp, "nak": r["nak"],
-                        "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
-                        "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
-                        "key_exchange": r.get("key_exchange"),
-                        "response_rf": r["responses"].as_array().and_then(|a| a.first()).map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "relay_node": e["relay_node"]})),
-                    })
+            let is_get = msg.as_object().is_some_and(|m| m.keys().all(|k| k.starts_with("get_") || k == "session_passkey"));
+            if !is_get && msg.get("session_passkey").is_none() {
+                if let Ok(c) = daemon::call(&cfg.api, &json!({"cmd": "passkey", "to": to})) {
+                    if let Some(pk) = c["passkey"].as_str() {
+                        msg["session_passkey"] = json!(pk);
+                    }
                 }
-                Err(e) => json!({"item": label, "ok": false, "error": format!("{e:#}")}),
-            };
-            eprintln!("{}", json!({"progress": entry["item"], "ok": entry["ok"]}));
-            results.push(entry);
+            }
+            if !is_get && msg.get("session_passkey").is_none() {
+                let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
+                let r = pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
+                let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
+                msg["session_passkey"] = json!(pk);
+            }
+            vec![(op_label(op), msg)]
         }
-        Ok(json!({"node": packet::node_id(to), "results": results}))
+        AdminOp::Set { item, changes, apply, allow_disruptive, verify_delay } => {
+            let items = admin_items(std::slice::from_ref(item))?;
+            if items.len() != 1 {
+                bail!("set takes exactly one item");
+            }
+            let changes: Value = serde_json::from_str(changes).context("CHANGES JSON")?;
+            let req = json!({
+                "cmd": "admin_set", "to": to, "get": items[0].1, "changes": changes,
+                "apply": apply, "allow_disruptive": allow_disruptive, "verify_delay_s": verify_delay,
+                "wait_s": w.wait, "retries": w.retries, "hop_limit": w.hop_limit,
+            });
+            let r = match daemon::call(&cfg.api, &req) {
+                Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
+                    nodeinfo_exchange(cfg, to, *w)?;
+                    daemon::call(&cfg.api, &req)?
+                }
+                r => r?,
+            };
+            return Ok(r);
+        }
+    };
+    let mut results = Vec::new();
+    for (label, msg) in items {
+        let payload = proto::encode_json("AdminMessage", &msg)?;
+        // get_* expect a response; other messages (set_*, reboot, ...) only an ACK.
+        let is_get = msg.as_object().is_some_and(|m| m.keys().any(|k| k.starts_with("get_")));
+        let ack_only = matches!(op, AdminOp::Raw { ack_only: true, .. });
+        let fire = w.no_wait && !is_get;
+        let r = if fire {
+            let wf = WaitOpts { wait: 0.0, retries: 0, ..*w };
+            daemon::call(&cfg.api, &send_req(to, "ADMIN_APP", &payload, false, false, Some(true), 0, wf))
+        } else {
+            pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w)
+        };
+        let entry = match r {
+            Ok(r) => {
+                let resp = r["responses"].as_array().and_then(|a| a.first()).map(|e| e["data"]["payload"].clone());
+                // Non-get: ack_only -> ok = ACK; else ok = no NAK (silence = not rejected; delivery unconfirmed).
+                let ok = if fire {
+                    r["transmissions"].as_array().is_some_and(|a| !a.is_empty())
+                } else if is_get {
+                    resp.is_some()
+                } else if ack_only {
+                    r["acked"].as_bool().unwrap_or(false) && r["nak"].is_null()
+                } else {
+                    r["nak"].is_null()
+                };
+                json!({
+                    "item": label, "ok": ok, "fire_and_forget": fire, "acked": r["acked"], "response": resp, "nak": r["nak"],
+                    "packet_id": r["packet_id"], "transmissions": r["transmissions"].as_array().map(|a| a.len()),
+                    "relays_heard": r["relays_heard"].as_array().map(|a| a.len()),
+                    "key_exchange": r.get("key_exchange"),
+                    "response_rf": r["responses"].as_array().and_then(|a| a.first()).map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "relay_node": e["relay_node"]})),
+                })
+            }
+            Err(e) => json!({"item": label, "ok": false, "error": format!("{e:#}")}),
+        };
+        eprintln!("{}", json!({"progress": entry["item"], "ok": entry["ok"]}));
+        results.push(entry);
+    }
+    Ok(json!({"node": packet::node_id(to), "results": results}))
 }
 
 /// Send our NodeInfo to `to` over the channel, requesting theirs.
@@ -499,7 +526,9 @@ fn request(cfg: &Config, to: u32, kind: &str, w: WaitOpts) -> Result<Value> {
         "response_rf": resp.as_ref().map(|e| json!({"rssi": e["rssi"], "snr": e["snr"], "hops_taken": e["hops_taken"], "hop_start": e["hop_start"], "relay_node": e["relay_node"], "rx_time": e["rx_time"], "frame_id": e["frame_id"]})),
     });
     if r["nak"] == "NO_RESPONSE" {
-        out["note"] = json!("node has no handler for this request (module disabled, variant unsupported, or reply throttled: position/neighbors 1 per 3 min)");
+        out["note"] = json!(
+            "node has no handler for this request (module disabled, variant unsupported, or reply throttled: position/neighbors 1 per 3 min)"
+        );
     }
     if k == "traceroute" {
         if let Some(e) = &resp {
@@ -606,11 +635,8 @@ fn run(cli: &Cli) -> Result<()> {
             }
             let cfg = daemon::redacted(&cfg);
             let lora = cfg.lora()?;
-            let chans: Vec<Value> = cfg
-                .channels()?
-                .iter()
-                .map(|c| json!({"name": c.name, "hash": c.hash, "key_bits": c.key.len() * 8}))
-                .collect();
+            let chans: Vec<Value> =
+                cfg.channels()?.iter().map(|c| json!({"name": c.name, "hash": c.hash, "key_bits": c.key.len() * 8})).collect();
             print(&json!({
                 "config_path": cfg_path, "config_exists": cfg_path.exists(), "db_path": db_path,
                 "config": cfg,
@@ -746,11 +772,8 @@ fn run(cli: &Cli) -> Result<()> {
             let c = store::open_ro(&db_path)?;
             let n = packet::parse_node_id(id).context("bad node id")?;
             let node = store::query_json(&c, "SELECT * FROM nodes WHERE num = ?1", &[&n])?;
-            let metrics = store::query_json(
-                &c,
-                "SELECT * FROM v_device_metrics WHERE node_num = ?1 ORDER BY rx_time DESC LIMIT 50",
-                &[&n],
-            )?;
+            let metrics =
+                store::query_json(&c, "SELECT * FROM v_device_metrics WHERE node_num = ?1 ORDER BY rx_time DESC LIMIT 50", &[&n])?;
             print(&json!({"node": node.into_iter().next(), "device_metrics": metrics}));
         }
         Cmd::Sql { query } => {

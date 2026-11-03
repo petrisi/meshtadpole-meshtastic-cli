@@ -27,9 +27,10 @@ pub fn target_from_response(resp: &Value) -> Result<Target> {
     let o = resp.as_object().ok_or_else(|| anyhow::anyhow!("response is not an object"))?;
     for (get, set) in [("get_config_response", "set_config"), ("get_module_config_response", "set_module_config")] {
         if let Some(v) = o.get(get) {
-            let inner = v.as_object().filter(|m| m.len() == 1).ok_or_else(|| {
-                anyhow::anyhow!("{get} has no single variant (unsupported by this firmware?): {v}")
-            })?;
+            let inner = v
+                .as_object()
+                .filter(|m| m.len() == 1)
+                .ok_or_else(|| anyhow::anyhow!("{get} has no single variant (unsupported by this firmware?): {v}"))?;
             let (k, cur) = inner.iter().next().unwrap();
             return Ok(Target { set_field: set, variant: Some(k.clone()), current: cur.clone() });
         }
@@ -89,9 +90,7 @@ pub fn is_default(v: Option<&Value>) -> bool {
 
 fn eq(a: Option<&Value>, b: Option<&Value>) -> bool {
     match (a, b) {
-        (Some(Value::Object(x)), Some(Value::Object(y))) => {
-            x.keys().chain(y.keys()).all(|k| eq(x.get(k), y.get(k)))
-        }
+        (Some(Value::Object(x)), Some(Value::Object(y))) => x.keys().chain(y.keys()).all(|k| eq(x.get(k), y.get(k))),
         _ => a == b || (is_default(a) && is_default(b)),
     }
 }
@@ -135,11 +134,8 @@ pub fn check_security(merged: &Value, our_public_b64: &str) -> Result<()> {
     if !ok {
         bail!("security write refused: merged private_key is not 32 bytes (firmware 2.7.x would generate a new keypair)");
     }
-    let admins: Vec<&str> = merged
-        .get("admin_key")
-        .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_default();
+    let admins: Vec<&str> =
+        merged.get("admin_key").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
     if !admins.contains(&our_public_b64) {
         bail!("security write refused: our public key would be removed from admin_key (lockout)");
     }

@@ -65,14 +65,9 @@ impl Shared {
         let pid = ev["id"].as_u64().map(|x| x as u32);
         let from_me = self.me.is_some_and(|m| ev["from"] == json!(crate::packet::node_id(m)));
         self.waiters.lock().unwrap().retain(|w| {
-            if req == Some(w.id) || (from_me && pid == Some(w.id)) {
-                w.tx.send((ev.clone(), plain.cloned())).is_ok()
-            } else {
-                true
-            }
+            if req == Some(w.id) || (from_me && pid == Some(w.id)) { w.tx.send((ev.clone(), plain.cloned())).is_ok() } else { true }
         });
     }
-
 }
 
 fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()> {
@@ -88,7 +83,7 @@ fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()
                 let mut s = sh.status.lock().unwrap().clone();
                 s["frames"] = json!(sh.frames.load(Ordering::Relaxed));
                 s["tx_airtime_last_hour_ms"] = json!(sh.airtime.last_hour_ms());
-            s["loop_age_s"] = json!(sh.liveness.age_s().map(|a| (a * 10.0).round() / 10.0));
+                s["loop_age_s"] = json!(sh.liveness.age_s().map(|a| (a * 10.0).round() / 10.0));
                 s["duty_cycle_limit"] = json!(sh.cfg.node.duty_cycle_limit);
                 s["duty_cycle_enforce"] = json!(sh.cfg.node.duty_cycle_enforce);
                 writeln!(w, "{s}")?;
@@ -167,7 +162,12 @@ fn do_send_full(sh: &Shared, req: &SendReq) -> Result<(Value, Vec<Vec<u8>>)> {
     for attempt in 0..=req.retries {
         let (dtx, drx) = channel();
         let delay = Duration::from_millis(rand::random::<u64>() % 400);
-        sh.tx_queue.lock().unwrap().send(TxJob { frame: out.frame.clone(), meta: TxMeta { out: out.clone(), attempt }, delay, done: Some(dtx) })?;
+        sh.tx_queue.lock().unwrap().send(TxJob {
+            frame: out.frame.clone(),
+            meta: TxMeta { out: out.clone(), attempt },
+            delay,
+            done: Some(dtx),
+        })?;
         let tx = drx.recv_timeout(Duration::from_secs(60)).map_err(|_| anyhow!("tx queue timeout"))?.map_err(|e| anyhow!(e))?;
         txs.push(json!({"tx_frame_id": tx.id, "tx_time": tx.tx_time, "attempt": attempt, "len": tx.len, "airtime_ms": tx.airtime_ms}));
         let deadline = Instant::now() + Duration::from_secs_f64(req.wait_s);
@@ -211,19 +211,22 @@ fn do_send_full(sh: &Shared, req: &SendReq) -> Result<(Value, Vec<Vec<u8>>)> {
         }
     }
     sh.waiters.lock().unwrap().retain(|w| w.id != id);
-    Ok((json!({
-        "packet_id": id,
-        "to": crate::packet::node_id(out.header.to),
-        "port": crate::proto::port_name(out.portnum),
-        "encryption": out.encryption,
-        "transmissions": txs,
-        "acked": !acks.is_empty() && nak.is_none() || !responses.is_empty(),
-        "nak": nak,
-        "acks": acks,
-        "responses": responses,
-        "relays_heard": relays,
-        "complete": finished,
-    }), plains))
+    Ok((
+        json!({
+            "packet_id": id,
+            "to": crate::packet::node_id(out.header.to),
+            "port": crate::proto::port_name(out.portnum),
+            "encryption": out.encryption,
+            "transmissions": txs,
+            "acked": !acks.is_empty() && nak.is_none() || !responses.is_empty(),
+            "nak": nak,
+            "acks": acks,
+            "responses": responses,
+            "relays_heard": relays,
+            "complete": finished,
+        }),
+        plains,
+    ))
 }
 
 fn admin_req(to: u32, msg: &Value, want_response: bool, base: &Value) -> Result<SendReq> {
@@ -262,14 +265,15 @@ fn redacted_copy(v: &Value) -> Value {
 
 fn diff_json(d: &[(String, Value, Value)]) -> Value {
     let secret = |p: &str| crate::decode::is_redacted_field(p.rsplit('.').next().unwrap_or(p));
-    json!(d
-        .iter()
-        .map(|(p, b, a)| if secret(p) {
-            json!({"path": p, "before": crate::admin::REDACTED, "after": crate::admin::REDACTED})
-        } else {
-            json!({"path": p, "before": redacted_copy(b), "after": redacted_copy(a)})
-        })
-        .collect::<Vec<_>>())
+    json!(
+        d.iter()
+            .map(|(p, b, a)| if secret(p) {
+                json!({"path": p, "before": crate::admin::REDACTED, "after": crate::admin::REDACTED})
+            } else {
+                json!({"path": p, "before": redacted_copy(b), "after": redacted_copy(a)})
+            })
+            .collect::<Vec<_>>()
+    )
 }
 
 /// Read-modify-write of one admin item. See docs/cli.md "Admin writes".
@@ -384,11 +388,7 @@ fn auto_replies(
     if recent.contains_key(&(h.from, h.id)) {
         return vec![];
     }
-    let ch_idx = d
-        .channel
-        .as_deref()
-        .and_then(|n| sh.channels.iter().position(|c| c.name == n))
-        .unwrap_or(0);
+    let ch_idx = d.channel.as_deref().and_then(|n| sh.channels.iter().position(|c| c.name == n)).unwrap_or(0);
     let resp_hops = response_hop_limit(&h, sh.cfg.node.hop_limit);
     let mk = |port: &str, payload: Vec<u8>, request_id: u32, hop_limit: u8, want_ack: bool| -> Option<mesh::Outgoing> {
         let req = SendReq {

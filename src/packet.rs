@@ -55,10 +55,7 @@ impl Header {
         o[0..4].copy_from_slice(&self.to.to_le_bytes());
         o[4..8].copy_from_slice(&self.from.to_le_bytes());
         o[8..12].copy_from_slice(&self.id.to_le_bytes());
-        o[12] = (self.hop_limit & 0x07)
-            | (self.want_ack as u8) << 3
-            | (self.via_mqtt as u8) << 4
-            | (self.hop_start & 0x07) << 5;
+        o[12] = (self.hop_limit & 0x07) | (self.want_ack as u8) << 3 | (self.via_mqtt as u8) << 4 | (self.hop_start & 0x07) << 5;
         o[13] = self.channel_hash;
         o[14] = self.next_hop;
         o[15] = self.relay_node;

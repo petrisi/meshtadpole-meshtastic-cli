@@ -56,9 +56,7 @@ pub fn encrypt(shared: &[u8; 32], from: u32, id: u32, plain: &[u8], extra: u32) 
     let c = Cipher::new(GenericArray::from_slice(shared));
     let mut buf = plain.to_vec();
     let n = nonce(from, id, extra);
-    let tag = c
-        .encrypt_in_place_detached(GenericArray::from_slice(&n), b"", &mut buf)
-        .map_err(|_| anyhow!("ccm encrypt"))?;
+    let tag = c.encrypt_in_place_detached(GenericArray::from_slice(&n), b"", &mut buf).map_err(|_| anyhow!("ccm encrypt"))?;
     buf.extend_from_slice(&tag);
     buf.extend_from_slice(&extra.to_le_bytes());
     Ok(buf)

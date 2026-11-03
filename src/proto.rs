@@ -13,18 +13,13 @@ pub fn pool() -> &'static DescriptorPool {
 }
 
 fn opts() -> SerializeOptions {
-    SerializeOptions::new()
-        .use_proto_field_name(true)
-        .skip_default_fields(true)
-        .stringify_64_bit_integers(false)
+    SerializeOptions::new().use_proto_field_name(true).skip_default_fields(true).stringify_64_bit_integers(false)
 }
 
 /// Decode `bytes` as `meshtastic.<name>` into proto3-JSON (proto field names, defaults omitted).
 pub fn decode_json(name: &str, bytes: &[u8]) -> Result<Value> {
     let full = format!("meshtastic.{name}");
-    let desc = pool()
-        .get_message_by_name(&full)
-        .ok_or_else(|| anyhow!("unknown message {full}"))?;
+    let desc = pool().get_message_by_name(&full).ok_or_else(|| anyhow!("unknown message {full}"))?;
     let msg = DynamicMessage::decode(desc, bytes).with_context(|| format!("decode {full}"))?;
     Ok(msg.serialize_with_options(serde_json::value::Serializer, &opts())?)
 }
@@ -33,19 +28,14 @@ pub fn decode_json(name: &str, bytes: &[u8]) -> Result<Value> {
 pub fn encode_json(name: &str, v: &Value) -> Result<Vec<u8>> {
     use prost::Message;
     let full = format!("meshtastic.{name}");
-    let desc = pool()
-        .get_message_by_name(&full)
-        .ok_or_else(|| anyhow!("unknown message {full}"))?;
+    let desc = pool().get_message_by_name(&full).ok_or_else(|| anyhow!("unknown message {full}"))?;
     let msg = DynamicMessage::deserialize(desc, v.clone()).with_context(|| format!("json -> {full}"))?;
     Ok(msg.encode_to_vec())
 }
 
 /// PortNum enum value name, if known.
 pub fn port_name(n: i32) -> Option<String> {
-    pool()
-        .get_enum_by_name("meshtastic.PortNum")?
-        .get_value(n)
-        .map(|v| v.name().to_string())
+    pool().get_enum_by_name("meshtastic.PortNum")?.get_value(n).map(|v| v.name().to_string())
 }
 
 /// Payload message type carried by a port, or how to render it.

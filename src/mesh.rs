@@ -59,9 +59,7 @@ pub fn port_number(name: &str) -> Result<i32> {
     if let Ok(n) = name.parse::<i32>() {
         return Ok(n);
     }
-    e.get_value_by_name(&name.to_uppercase())
-        .map(|v| v.number())
-        .ok_or_else(|| anyhow!("unknown port {name}"))
+    e.get_value_by_name(&name.to_uppercase()).map(|v| v.number()).ok_or_else(|| anyhow!("unknown port {name}"))
 }
 
 pub fn random_id() -> u32 {

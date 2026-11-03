@@ -142,7 +142,13 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
     // PKC: unicast, hash 0, to us (or from us, heard as rebroadcast).
     if let Some(ctx) = pkc {
         if h.channel_hash == 0 && h.to != crate::packet::BROADCAST && enc.len() > crate::pkc::OVERHEAD {
-            let peer = if h.to == ctx.me { Some(h.from) } else if h.from == ctx.me { Some(h.to) } else { None };
+            let peer = if h.to == ctx.me {
+                Some(h.from)
+            } else if h.from == ctx.me {
+                Some(h.to)
+            } else {
+                None
+            };
             if let Some(peer) = peer {
                 let Some(pk) = ctx.keys.get(&peer) else {
                     let mut d = Decoded::bare(Status::Pkc, Some(h));
@@ -150,9 +156,7 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
                     return d;
                 };
                 let shared = ctx.id.shared(pk);
-                match crate::pkc::decrypt(&shared, h.from, h.id, enc).and_then(|p| {
-                    data_json(&p).map(|x| (x, p))
-                }) {
+                match crate::pkc::decrypt(&shared, h.from, h.id, enc).and_then(|p| data_json(&p).map(|x| (x, p))) {
                     Ok(((portnum, data), plain)) => {
                         return Decoded {
                             status: Status::Ok,
