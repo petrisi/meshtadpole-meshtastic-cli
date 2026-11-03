@@ -1,6 +1,6 @@
 [package]
 name = "meshtadpole-meshtastic-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Host-side Meshtastic node, daemon and CLI for the MeshTadpole SX1262 USB stick"
