@@ -332,9 +332,8 @@ fn admin_set(sh: &Shared, req: &Value) -> Result<Value> {
     let res = do_send(sh, &sreq)?;
     out["set_packet_id"] = res["packet_id"].clone();
     out["set_nak"] = res["nak"].clone();
-    if res["nak"].is_string() {
-        return Ok(out);
-    }
+    // Read back even after a NAK: the target may apply the set, reboot, and then NAK a relayed copy of the
+    // same packet (dedup history lost, passkey rotated).
     std::thread::sleep(Duration::from_secs_f64(verify_delay));
     match admin_get(sh, to, get, req) {
         Ok((_, rb)) => {

@@ -93,11 +93,12 @@ Firmware replaces a whole config section on set. Sequence (daemon `admin_set`):
    - `config:security`: merged `private_key` must be 32 bytes (2.7.x generates a new keypair otherwise); our public key must remain in `admin_key`.
    - `config:security`, `config:lora`, `channel:0` → refused without `--allow-disruptive`.
 5. Without `--apply`: dry run, returns before/after/diff.
-6. `set_*` with passkey, want_ack + want_response, single transmission, 20 s wait. NAK → stop (`set_nak`). Then wait `--verify-delay` and re-read; changed paths compared. `applied` = `verified`.
+6. `set_*` with passkey, want_ack + want_response, single transmission, 20 s wait; a NAK is reported in `set_nak`. Then wait `--verify-delay` and re-read; changed paths compared. `applied` = `verified`.
 
 Result fields: `node`, `set_field`, `variant`, `disruptive`, `before`, `after`, `diff[{path,before,after}]`, `changed`, `applied`, `dry_run`, `refused`, `set_packet_id`, `set_nak`, `verified`, `verify_mismatch`, `verify_error`, `identity_preserved` (security only: public and private key unchanged). Secret values appear as `<redacted>`.
 
 Many config writes make the node reboot; increase `--verify-delay` (e.g. 30) accordingly.
+The read-back runs even after a NAK: a node that applied the set and rebooted can NAK a relayed copy of the same packet (`ADMIN_BAD_SESSION_KEY`; seen on firmware 2.7.26). `applied` follows the read-back.
 
 `set_owner` (2.7.26) copies only non-empty `long_name`/`short_name`, `is_licensed`, `is_unmessagable`; names cannot be cleared.
 
