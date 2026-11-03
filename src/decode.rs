@@ -15,8 +15,6 @@ pub enum Status {
     Ok,
     /// Radio reported CRC error; header/payload untrusted.
     CrcError,
-    /// Radio reported LoRa header error; no payload.
-    HeaderError,
     /// Shorter than the 16-byte header.
     Short,
     /// No configured channel matches the channel hash (or it is a PKC packet not addressed to us).
@@ -152,7 +150,7 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
                     return d;
                 };
                 let shared = ctx.id.shared(pk);
-                match crate::pkc::decrypt(&shared, h.from, h.id, enc).map_err(anyhow::Error::from).and_then(|p| {
+                match crate::pkc::decrypt(&shared, h.from, h.id, enc).and_then(|p| {
                     data_json(&p).map(|x| (x, p))
                 }) {
                     Ok(((portnum, data), plain)) => {
@@ -212,23 +210,6 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
     Decoded::bare(Status::NoChannel, Some(h))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn redact_default_nested() {
-        let mut v = json!({"get_config_response": {
-            "security": {"private_key": "SECRET", "public_key": "PUB", "admin_key": ["A"]},
-            "network": {"wifi_psk": "W", "wifi_ssid": "S"}}});
-        redact(&mut v);
-        let s = &v["get_config_response"];
-        assert_eq!(s["security"]["private_key"], "<redacted>");
-        assert_eq!(s["security"]["public_key"], "PUB");
-        assert_eq!(s["network"]["wifi_psk"], "<redacted>");
-        assert_eq!(s["network"]["wifi_ssid"], "S");
-    }
-}
-
 /// Compact JSON for a decoded frame, used by `listen` and `decode`.
 pub fn to_json(d: &Decoded) -> Value {
     let mut v = json!({ "status": d.status });
@@ -259,4 +240,21 @@ pub fn to_json(d: &Decoded) -> Value {
         o.insert("error".into(), json!(e));
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn redact_default_nested() {
+        let mut v = json!({"get_config_response": {
+            "security": {"private_key": "SECRET", "public_key": "PUB", "admin_key": ["A"]},
+            "network": {"wifi_psk": "W", "wifi_ssid": "S"}}});
+        redact(&mut v);
+        let s = &v["get_config_response"];
+        assert_eq!(s["security"]["private_key"], "<redacted>");
+        assert_eq!(s["security"]["public_key"], "PUB");
+        assert_eq!(s["network"]["wifi_psk"], "<redacted>");
+        assert_eq!(s["network"]["wifi_ssid"], "S");
+    }
 }

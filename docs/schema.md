@@ -85,7 +85,7 @@ Our packets heard back via relays appear in `rx_frames` with `pkt_from` = our no
 | Column | Meaning |
 |---|---|
 | t, session_id | |
-| event | `connected` (detail = USB serial), `disconnected`, `open_failed` (detail = error; logged when the error changes), `rx_restored` (watchdog) |
+| event | `connected` (detail = USB serial), `disconnected`, `open_failed` (detail = error; logged when the error changes), `rx_restored` (detail prefix: `agc_stuck`, `agc_periodic`, `mode_watchdog`), `stalled` (radio loop blocked 120 s; daemon exits 70 for a service manager to restart) |
 
 Gaps in reception: combine `sessions` (daemon running) with `radio_events` (stick connected).
 

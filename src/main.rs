@@ -288,6 +288,7 @@ fn admin_items(items: &[String]) -> Result<Vec<(String, Value)>> {
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_req(to: u32, port: &str, payload: &[u8], want_ack: bool, want_response: bool, pkc: Option<bool>, channel: usize, w: WaitOpts) -> Value {
     json!({
         "cmd": "send", "to": to, "port": port,
@@ -320,7 +321,7 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
                 }
                 if !is_get && msg.get("session_passkey").is_none() {
                     let payload = proto::encode_json("AdminMessage", &json!({"get_config_request": "SESSIONKEY_CONFIG"}))?;
-                    let r = pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
+                    let r = pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, true, Some(true), 0, *w), to, *w)?;
                     let pk = r["responses"][0]["data"]["payload"]["session_passkey"]
                         .as_str()
                         .ok_or_else(|| anyhow!("could not obtain session_passkey: {}", r["nak"]))?;
@@ -341,7 +342,7 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
                 });
                 let r = match daemon::call(&cfg.api, &req) {
                     Err(e) if format!("{e:#}").contains("PKI_UNKNOWN_PUBKEY") => {
-                        nodeinfo_exchange(&cfg, to, *w)?;
+                        nodeinfo_exchange(cfg, to, *w)?;
                         daemon::call(&cfg.api, &req)?
                     }
                     r => r?,
@@ -360,7 +361,7 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
                 let wf = WaitOpts { wait: 0.0, retries: 0, ..*w };
                 daemon::call(&cfg.api, &send_req(to, "ADMIN_APP", &payload, false, false, Some(true), 0, wf))
             } else {
-                pkc_call(&cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w)
+                pkc_call(cfg, &send_req(to, "ADMIN_APP", &payload, true, !ack_only, Some(true), 0, *w), to, *w)
             };
             let entry = match r {
                 Ok(r) => {

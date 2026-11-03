@@ -48,6 +48,7 @@ struct Shared {
     waiters: Mutex<Vec<Waiter>>,
     tx_queue: Mutex<Sender<Job>>,
     airtime: Arc<Airtime>,
+    liveness: Arc<link::Liveness>,
     passkeys: Mutex<HashMap<u32, (String, f64)>>,
     status: Mutex<Value>,
     frames: AtomicU64,
@@ -87,6 +88,7 @@ fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()
                 let mut s = sh.status.lock().unwrap().clone();
                 s["frames"] = json!(sh.frames.load(Ordering::Relaxed));
                 s["tx_airtime_last_hour_ms"] = json!(sh.airtime.last_hour_ms());
+            s["loop_age_s"] = json!(sh.liveness.age_s().map(|a| (a * 10.0).round() / 10.0));
                 s["duty_cycle_limit"] = json!(sh.cfg.node.duty_cycle_limit);
                 s["duty_cycle_enforce"] = json!(sh.cfg.node.duty_cycle_enforce);
                 writeln!(w, "{s}")?;
@@ -98,7 +100,7 @@ fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()
             Some("send") => {
                 let res = serde_json::from_value::<SendReq>(req.clone())
                     .map_err(|e| anyhow!("bad send request: {e}"))
-                    .and_then(|r| do_send(&sh, &r));
+                    .and_then(|r| do_send(sh, &r));
                 let out = match res {
                     Ok(v) => v,
                     Err(e) => json!({"error": format!("{e:#}")}),
@@ -122,7 +124,7 @@ fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()
                 writeln!(w, "{v}")?;
             }
             Some("admin_set") => {
-                let out = match admin_set(&sh, &req) {
+                let out = match admin_set(sh, &req) {
                     Ok(v) => v,
                     Err(e) => json!({"error": format!("{e:#}")}),
                 };
@@ -595,6 +597,7 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
         waiters: Mutex::new(Vec::new()),
         tx_queue: Mutex::new(qtx),
         airtime: airtime.clone(),
+        liveness: Arc::new(link::Liveness::default()),
         passkeys: Mutex::new(HashMap::new()),
         status: Mutex::new(Value::Null),
         frames: AtomicU64::new(0),
@@ -627,8 +630,25 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
         duty_cycle_limit: cfg.node.duty_cycle_limit,
         duty_cycle_enforce: cfg.node.duty_cycle_enforce,
         stats_interval: Duration::from_secs(60),
+        liveness: sh.liveness.clone(),
         agc_reset_interval: cfg.radio.agc_reset_interval_s.filter(|&s| s > 0).map(Duration::from_secs),
     };
+    {
+        // Blocked radio loop (no iteration for 120 s): record and exit for the service manager to restart.
+        let db = db.to_path_buf();
+        let sid = w.session_id;
+        link::spawn_watchdog(sh.liveness.clone(), Duration::from_secs(120), move |age| {
+            let msg = format!("radio loop blocked for {age:.0} s; exiting");
+            eprintln!("{}", json!({"event": "stalled", "detail": msg}));
+            if let Ok(c) = store::open_rw(&db) {
+                let _ = c.execute(
+                    "INSERT INTO radio_events(session_id,t,event,detail) VALUES(?1,?2,'stalled',?3)",
+                    meshtadpole_radio::store::rusqlite::params![sid, store::now(), msg],
+                );
+            }
+            std::process::exit(70);
+        });
+    }
     let mut h = Mt { sh: sh.clone(), w, acked_recent: HashMap::new() };
     let res = link::run(&lc, &mut h, &qrx, &airtime, &sh.stop).map_err(|e| anyhow!(e));
     h.w.s.end()?;

@@ -197,7 +197,7 @@ All automatic replies use channel encryption, are rate-limited to one per (from,
 - Starts without the stick and keeps retrying.
 - USB/radio error: daemon and API stay up; `radio_events` gets `disconnected`; reopen retried with backoff 1 s → 30 s max; `connected` on success (radio fully reconfigured). Queued and new sends fail with `radio not connected` meanwhile. `status.radio` = `connected`/`disconnected`.
 - Watchdog every 60 s: if the SX1262 is not in RX mode while idle, it is reconfigured (`rx_restored`).
-- Non-radio errors (e.g. database) stop the daemon; run it under a service manager for restart.
+- Non-radio errors (e.g. database) stop the daemon; a radio loop blocked for 120 s logs `stalled` and exits with code 70. Run it under a service manager for restart (systemd `Restart=always`; Windows Task Scheduler restart-on-failure). `status.loop_age_s` = seconds since the last radio loop iteration.
 
 ## Daemon API
 
