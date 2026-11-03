@@ -567,7 +567,10 @@ dependencies = [
 name = "meshtadpole-radio"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "rusb",
+ "rusqlite",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

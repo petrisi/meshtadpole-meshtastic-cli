@@ -12,22 +12,25 @@ use crate::mesh::{self, SendReq};
 use crate::store::{self, Writer};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use meshtadpole_radio::{ch341, sx1262};
+use meshtadpole_radio::link::{self, Airtime, TxJob};
+use meshtadpole_radio::{api, sx1262};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-struct TxJob {
+/// Per-transmission data handed through the radio link.
+pub struct TxMeta {
     out: mesh::Outgoing,
     attempt: u32,
-    done: Sender<Result<Value>>,
 }
+
+type Job = TxJob<TxMeta>;
 
 struct Waiter {
     id: u32,
@@ -41,10 +44,10 @@ struct Shared {
     me: Option<u32>,
     channels: Vec<Channel>,
     pkc: Option<RwLock<PkcCtx>>,
-    subscribers: Mutex<Vec<TcpStream>>,
+    subscribers: api::Subscribers,
     waiters: Mutex<Vec<Waiter>>,
-    tx_queue: Mutex<Sender<TxJob>>,
-    tx_log: Mutex<VecDeque<(Instant, f64)>>,
+    tx_queue: Mutex<Sender<Job>>,
+    airtime: Arc<Airtime>,
     passkeys: Mutex<HashMap<u32, (String, f64)>>,
     status: Mutex<Value>,
     frames: AtomicU64,
@@ -53,8 +56,7 @@ struct Shared {
 
 impl Shared {
     fn broadcast(&self, v: &Value) {
-        let line = format!("{v}\n");
-        self.subscribers.lock().unwrap().retain_mut(|s| s.write_all(line.as_bytes()).is_ok());
+        self.subscribers.broadcast(&v.to_string());
     }
 
     fn notify_waiters(&self, ev: &Value, plain: Option<&Vec<u8>>) {
@@ -70,49 +72,28 @@ impl Shared {
         });
     }
 
-    fn airtime_last_hour_ms(&self) -> f64 {
-        let mut log = self.tx_log.lock().unwrap();
-        while log.front().is_some_and(|(t, _)| t.elapsed() > Duration::from_secs(3600)) {
-            log.pop_front();
-        }
-        log.iter().map(|(_, a)| a).sum()
-    }
 }
 
-fn serve(listener: TcpListener, sh: Arc<Shared>) {
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let sh = sh.clone();
-        std::thread::spawn(move || {
-            let _ = handle_client(stream, sh);
-        });
-    }
-}
-
-fn handle_client(stream: TcpStream, sh: Arc<Shared>) -> Result<()> {
-    let mut w = stream.try_clone()?;
-    let r = BufReader::new(stream.try_clone()?);
-    for line in r.lines() {
-        let line = line?;
-        let req: Value = match serde_json::from_str(&line) {
+fn handle_line(line: &str, w: &mut TcpStream, sh: &Shared) -> std::io::Result<()> {
+    {
+        let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                writeln!(w, "{}", json!({"error": format!("bad request: {e}")}))?;
-                continue;
+                return writeln!(w, "{}", json!({"error": format!("bad request: {e}")}));
             }
         };
         match req["cmd"].as_str() {
             Some("status") => {
                 let mut s = sh.status.lock().unwrap().clone();
                 s["frames"] = json!(sh.frames.load(Ordering::Relaxed));
-                s["tx_airtime_last_hour_ms"] = json!(sh.airtime_last_hour_ms());
+                s["tx_airtime_last_hour_ms"] = json!(sh.airtime.last_hour_ms());
                 s["duty_cycle_limit"] = json!(sh.cfg.node.duty_cycle_limit);
                 s["duty_cycle_enforce"] = json!(sh.cfg.node.duty_cycle_enforce);
                 writeln!(w, "{s}")?;
             }
             Some("subscribe") => {
                 writeln!(w, "{}", json!({"subscribed": true}))?;
-                sh.subscribers.lock().unwrap().push(stream.try_clone()?);
+                sh.subscribers.add(w.try_clone()?);
             }
             Some("send") => {
                 let res = serde_json::from_value::<SendReq>(req.clone())
@@ -183,9 +164,10 @@ fn do_send_full(sh: &Shared, req: &SendReq) -> Result<(Value, Vec<Vec<u8>>)> {
     let mut finished = false;
     for attempt in 0..=req.retries {
         let (dtx, drx) = channel();
-        sh.tx_queue.lock().unwrap().send(TxJob { out: out.clone(), attempt, done: dtx })?;
-        let tx = drx.recv_timeout(Duration::from_secs(60)).map_err(|_| anyhow!("tx queue timeout"))??;
-        txs.push(tx);
+        let delay = Duration::from_millis(rand::random::<u64>() % 400);
+        sh.tx_queue.lock().unwrap().send(TxJob { frame: out.frame.clone(), meta: TxMeta { out: out.clone(), attempt }, delay, done: Some(dtx) })?;
+        let tx = drx.recv_timeout(Duration::from_secs(60)).map_err(|_| anyhow!("tx queue timeout"))?.map_err(|e| anyhow!(e))?;
+        txs.push(json!({"tx_frame_id": tx.id, "tx_time": tx.tx_time, "attempt": attempt, "len": tx.len, "airtime_ms": tx.airtime_ms}));
         let deadline = Instant::now() + Duration::from_secs_f64(req.wait_s);
         let mut heard_anything = false;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -503,65 +485,116 @@ fn load_keys(db: &Path) -> HashMap<u32, [u8; 32]> {
     m
 }
 
-/// Channel busy: preamble/header detected without completion. Stale flags (> 3 s) are cleared.
-fn channel_busy(radio: &mut sx1262::Sx1262, since: &mut Option<Instant>) -> Result<bool> {
-    let irq = radio.get_irq_status()?;
-    let active = irq & (sx1262::irq::PREAMBLE_DETECTED | sx1262::irq::HEADER_VALID) != 0 && irq & sx1262::irq::RX_DONE == 0;
-    if !active {
-        *since = None;
-        return Ok(false);
-    }
-    let t = *since.get_or_insert_with(Instant::now);
-    if t.elapsed() > Duration::from_secs(3) {
-        radio.clear_irq(sx1262::irq::PREAMBLE_DETECTED | sx1262::irq::HEADER_VALID)?;
-        *since = None;
-        return Ok(false);
-    }
-    Ok(true)
+/// Protocol side of the radio link.
+struct Mt {
+    sh: Arc<Shared>,
+    w: Writer,
+    acked_recent: HashMap<(u32, u32), Instant>,
 }
 
-/// Open, configure and start RX on the stick.
-fn open_radio(cfg: &Config, lora: &sx1262::LoraConfig) -> Result<(sx1262::Sx1262, String)> {
-    let bus = ch341::Ch341::open(cfg.usb_serial.as_deref()).context("open MeshTadpole")?;
-    let usb_serial = bus.info.serial.clone().unwrap_or_default();
-    let mut radio = sx1262::Sx1262::new(bus, sx1262::MESHTADPOLE_PINS)?;
-    radio.configure(lora).context("configure SX1262")?;
-    radio.start_rx()?;
-    Ok((radio, usb_serial))
-}
+impl link::Handler for Mt {
+    type Meta = TxMeta;
 
-/// Error originates from the USB/radio layer (reconnect) rather than DB/logic (exit).
-fn is_radio_error(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<meshtadpole_radio::Error>().is_some())
+    fn event(&mut self, ev: &link::Event) -> Result<(), link::BoxError> {
+        self.w.s.radio_event(ev.name(), ev.detail())?;
+        let mut st = self.sh.status.lock().unwrap();
+        match ev {
+            link::Event::Connected { usb_serial } => {
+                st["radio"] = json!("connected");
+                st["usb_serial"] = json!(usb_serial);
+                eprintln!("{}", json!({"event": "connected", "usb_serial": usb_serial}));
+            }
+            link::Event::Disconnected { error } => {
+                st["radio"] = json!("disconnected");
+                eprintln!("{}", json!({"event": "disconnected", "error": error}));
+            }
+            link::Event::OpenFailed { error } => eprintln!("{}", json!({"event": "open_failed", "error": error})),
+            link::Event::RxRestored { detail } => eprintln!("{}", json!({"event": "rx_restored", "detail": detail})),
+        }
+        Ok(())
+    }
+
+    fn frame(&mut self, t: f64, f: &sx1262::RxFrame, airtime: f64) -> Result<Vec<Job>, link::BoxError> {
+        let sh = &self.sh;
+        let d = {
+            let pk = sh.pkc.as_ref().map(|l| l.read().unwrap());
+            decode_frame(&f.data, f.crc_error, &sh.channels, pk.as_deref())
+        };
+        if d.portnum == Some(4) {
+            if let (Some(pk), Some(h), Some(k)) = (&sh.pkc, d.header, d.data.as_ref().and_then(|x| x["payload"]["public_key"].as_str())) {
+                if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(k) {
+                    if let Ok(a) = <[u8; 32]>::try_from(b.as_slice()) {
+                        pk.write().unwrap().keys.insert(h.from, a);
+                    }
+                }
+            }
+        }
+        let (id, dup_of) = self.w.insert_frame(t, f, airtime, &d)?;
+        sh.frames.fetch_add(1, Ordering::Relaxed);
+        let mut ev = to_json(&d);
+        ev["frame_id"] = json!(id);
+        ev["rx_time"] = json!(t);
+        ev["rssi"] = json!(f.rssi_dbm);
+        ev["snr"] = json!(f.snr_db);
+        ev["freq_error_hz"] = json!(f.freq_error_hz.round());
+        ev["len"] = json!(f.data.len());
+        ev["airtime_ms"] = json!((airtime * 10.0).round() / 10.0);
+        ev["dup_of"] = json!(dup_of);
+        sh.broadcast(&ev);
+        sh.notify_waiters(&ev, d.plaintext.as_ref());
+        Ok(auto_replies(sh, &d, f, &mut self.acked_recent)
+            .into_iter()
+            .map(|out| TxJob {
+                frame: out.frame.clone(),
+                meta: TxMeta { out, attempt: 0 },
+                delay: Duration::from_millis(100 + rand::random::<u64>() % 300),
+                done: None,
+            })
+            .collect())
+    }
+
+    fn header_error(&mut self, t: f64, rssi: f32) -> Result<(), link::BoxError> {
+        let id = self.w.insert_header_error(t, rssi)?;
+        self.sh.broadcast(&json!({"frame_id": id, "rx_time": t, "status": "header_error", "rssi": rssi}));
+        Ok(())
+    }
+
+    fn transmitted(&mut self, job: &Job, t: f64, airtime: f64, error: Option<&str>) -> Result<i64, link::BoxError> {
+        let o = &job.meta.out;
+        Ok(self.w.insert_tx(t, &o.frame, airtime, &o.header, o.encryption, o.portnum, &o.data_json, job.meta.attempt, error)?)
+    }
+
+    fn stats(&mut self, s: &link::Stats) -> Result<(), link::BoxError> {
+        Ok(self.w.s.radio_stats(s)?)
+    }
+
+    fn heartbeat(&mut self) -> Result<(), link::BoxError> {
+        Ok(self.w.s.heartbeat()?)
+    }
 }
 
 pub fn run(cfg: &Config, db: &Path) -> Result<()> {
     let listener = TcpListener::bind(&cfg.api).with_context(|| format!("bind API {} (daemon already running?)", cfg.api))?;
     let channels = cfg.channels()?;
     let lora = cfg.lora()?;
-    // Start even without the stick; the main loop keeps retrying.
-    let (mut radio_opt, usb_serial, open_err) = match open_radio(cfg, &lora) {
-        Ok((r, s)) => (Some(r), s, None),
-        Err(e) => (None, String::new(), Some(format!("{e:#}"))),
-    };
-
-    let w = Writer::start_session(store::open_rw(db)?, &usb_serial, &lora, &serde_json::to_string(&redacted(cfg))?)?;
+    let w = Writer::start_session(store::open_rw(db)?, "", &lora, &serde_json::to_string(&redacted(cfg))?)?;
     let me = cfg.node.num;
     let pkc = match (&cfg.node.private_key, me) {
         (Some(k), Some(me)) => Some(RwLock::new(PkcCtx { me, id: crate::pkc::Identity::from_b64(k)?, keys: load_keys(db) })),
         _ => None,
     };
-    let (qtx, qrx): (Sender<TxJob>, Receiver<TxJob>) = channel();
+    let (qtx, qrx) = channel::<Job>();
+    let airtime = Arc::new(Airtime::default());
     let sh = Arc::new(Shared {
         cfg: cfg.clone(),
         db: db.to_path_buf(),
         me,
-        channels: channels.clone(),
+        channels,
         pkc,
-        subscribers: Mutex::new(Vec::new()),
+        subscribers: api::Subscribers::default(),
         waiters: Mutex::new(Vec::new()),
         tx_queue: Mutex::new(qtx),
-        tx_log: Mutex::new(VecDeque::new()),
+        airtime: airtime.clone(),
         passkeys: Mutex::new(HashMap::new()),
         status: Mutex::new(Value::Null),
         frames: AtomicU64::new(0),
@@ -571,7 +604,8 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
         "pid": std::process::id(),
         "session_id": w.session_id,
         "started": store::now(),
-        "usb_serial": usb_serial,
+        "radio": "disconnected",
+        "usb_serial": null,
         "db": db.display().to_string(),
         "node_num": me.map(crate::packet::node_id),
         "public_key": sh.pkc.as_ref().map(|p| p.read().unwrap().id.public_b64()),
@@ -580,211 +614,25 @@ pub fn run(cfg: &Config, db: &Path) -> Result<()> {
     });
     {
         let sh = sh.clone();
-        std::thread::spawn(move || serve(listener, sh));
+        std::thread::spawn(move || api::serve(listener, move |line: &str, w: &mut TcpStream| handle_line(line, w, &sh)));
     }
     {
         let sh = sh.clone();
         ctrlc::set_handler(move || sh.stop.store(true, Ordering::SeqCst)).ok();
     }
     eprintln!("{}", json!({"event": "started", "status": *sh.status.lock().unwrap()}));
-    match &open_err {
-        None => w.insert_radio_event("connected", &usb_serial)?,
-        Some(e) => {
-            w.insert_radio_event("open_failed", e)?;
-            eprintln!("{}", json!({"event": "open_failed", "error": e}));
-        }
-    }
-    sh.status.lock().unwrap()["radio"] = json!(if radio_opt.is_some() { "connected" } else { "disconnected" });
-    let mut backoff = Duration::from_secs(1);
-    let mut next_try = Instant::now() + backoff;
-    let mut last_open_err = open_err;
-
-    let mut stat_t0 = store::now();
-    let mut last_stat = Instant::now();
-    let mut last_noise = Instant::now();
-    let (mut n, mut nmin, mut nsum, mut nmax) = (0u32, f32::MAX, 0f32, f32::MIN);
-    let (mut frames, mut crc, mut hdr, mut air) = (0u32, 0u32, 0u32, 0f64);
-    let mut pending: VecDeque<(TxJob, Instant)> = VecDeque::new();
-    let mut busy_since: Option<Instant> = None;
-    let mut acked_recent: HashMap<(u32, u32), Instant> = HashMap::new();
-
-    let res: Result<()> = loop {
-        if sh.stop.load(Ordering::SeqCst) {
-            break Ok(());
-        }
-        let Some(radio) = radio_opt.as_mut() else {
-            // Disconnected: fail queued TX, keep heartbeat, retry open with backoff (max 30 s).
-            while let Ok(job) = qrx.try_recv() {
-                let _ = job.done.send(Err(anyhow!("radio not connected")));
-            }
-            for (job, _) in pending.drain(..) {
-                let _ = job.done.send(Err(anyhow!("radio not connected")));
-            }
-            if last_stat.elapsed() >= Duration::from_secs(60) {
-                w.heartbeat()?;
-                last_stat = Instant::now();
-                stat_t0 = store::now();
-            }
-            if Instant::now() >= next_try {
-                match open_radio(cfg, &lora) {
-                    Ok((r, serial)) => {
-                        w.insert_radio_event("connected", &serial)?;
-                        eprintln!("{}", json!({"event": "connected", "usb_serial": serial}));
-                        sh.status.lock().unwrap()["radio"] = json!("connected");
-                        sh.status.lock().unwrap()["usb_serial"] = json!(serial);
-                        radio_opt = Some(r);
-                        backoff = Duration::from_secs(1);
-                        last_open_err = None;
-                    }
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        if last_open_err.as_deref() != Some(msg.as_str()) {
-                            w.insert_radio_event("open_failed", &msg)?;
-                            eprintln!("{}", json!({"event": "open_failed", "error": msg}));
-                            last_open_err = Some(msg);
-                        }
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                        next_try = Instant::now() + backoff;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(200));
-            continue;
-        };
-        let r: Result<()> = (|| {
-        while !sh.stop.load(Ordering::SeqCst) {
-            while let Ok(job) = qrx.try_recv() {
-                let backoff = Duration::from_millis(rand::random::<u64>() % 400);
-                pending.push_back((job, Instant::now() + backoff));
-            }
-            let mut did_rx = false;
-            match radio.poll(&lora)? {
-                Some(sx1262::RxEvent::Frame(f)) => {
-                    did_rx = true;
-                    let t = store::now();
-                    let airtime = lora.time_on_air_us(f.data.len()) / 1000.0;
-                    let d = {
-                        let pk = sh.pkc.as_ref().map(|l| l.read().unwrap());
-                        decode_frame(&f.data, f.crc_error, &channels, pk.as_deref())
-                    };
-                    if d.portnum == Some(4) {
-                        if let (Some(pk), Some(h), Some(k)) = (&sh.pkc, d.header, d.data.as_ref().and_then(|x| x["payload"]["public_key"].as_str())) {
-                            if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(k) {
-                                if let Ok(a) = <[u8; 32]>::try_from(b.as_slice()) {
-                                    pk.write().unwrap().keys.insert(h.from, a);
-                                }
-                            }
-                        }
-                    }
-                    let (id, dup_of) = w.insert_frame(t, &f, airtime, &d)?;
-                    frames += 1;
-                    crc += f.crc_error as u32;
-                    air += airtime;
-                    sh.frames.fetch_add(1, Ordering::Relaxed);
-                    let mut ev = to_json(&d);
-                    ev["frame_id"] = json!(id);
-                    ev["rx_time"] = json!(t);
-                    ev["rssi"] = json!(f.rssi_dbm);
-                    ev["snr"] = json!(f.snr_db);
-                    ev["freq_error_hz"] = json!(f.freq_error_hz.round());
-                    ev["len"] = json!(f.data.len());
-                    ev["airtime_ms"] = json!((airtime * 10.0).round() / 10.0);
-                    ev["dup_of"] = json!(dup_of);
-                    sh.broadcast(&ev);
-                    sh.notify_waiters(&ev, d.plaintext.as_ref());
-                    for out in auto_replies(&sh, &d, &f, &mut acked_recent) {
-                        let (dtx, _drx) = channel();
-                        let backoff = Duration::from_millis(100 + rand::random::<u64>() % 300);
-                        pending.push_back((TxJob { out, attempt: 0, done: dtx }, Instant::now() + backoff));
-                    }
-                }
-                Some(sx1262::RxEvent::HeaderError { rssi_inst_dbm, .. }) => {
-                    did_rx = true;
-                    let t = store::now();
-                    let id = w.insert_header_error(t, rssi_inst_dbm)?;
-                    hdr += 1;
-                    sh.broadcast(&json!({"frame_id": id, "rx_time": t, "status": "header_error", "rssi": rssi_inst_dbm}));
-                }
-                None => {}
-            }
-            if !did_rx {
-                if let Some((_, at)) = pending.front() {
-                    if Instant::now() >= *at {
-                        if channel_busy(radio, &mut busy_since)? {
-                            let (job, _) = pending.pop_front().unwrap();
-                            let at = Instant::now() + Duration::from_millis(200 + rand::random::<u64>() % 600);
-                            pending.push_front((job, at));
-                        } else {
-                            let (job, _) = pending.pop_front().unwrap();
-                            let r = transmit(radio, &lora, &sh, &w, &job);
-                            let _ = job.done.send(r);
-                        }
-                    }
-                } else if last_noise.elapsed() >= Duration::from_secs(1) {
-                    let r = radio.rssi_inst()?;
-                    n += 1;
-                    nmin = nmin.min(r);
-                    nmax = nmax.max(r);
-                    nsum += r;
-                    last_noise = Instant::now();
-                }
-                std::thread::sleep(Duration::from_millis(3));
-            }
-            if last_stat.elapsed() >= Duration::from_secs(60) {
-                let t1 = store::now();
-                let avg = if n > 0 { nsum / n as f32 } else { f32::NAN };
-                w.insert_radio_stats(stat_t0, t1, n, nmin, avg, nmax, frames, crc, hdr, air)?;
-                w.heartbeat()?;
-                // Watchdog: chip must be in RX (mode 5) when idle; otherwise reconfigure.
-                let (mode, _) = sx1262::status_fields(radio.get_status()?);
-                if mode != 5 && pending.is_empty() {
-                    radio.configure(&lora)?;
-                    radio.start_rx()?;
-                    w.insert_radio_event("rx_restored", &format!("chip mode was {mode}"))?;
-                }
-                (n, nmin, nsum, nmax) = (0, f32::MAX, 0.0, f32::MIN);
-                (frames, crc, hdr, air) = (0, 0, 0, 0.0);
-                stat_t0 = t1;
-                last_stat = Instant::now();
-            }
-        }
-        Ok(())
-        })();
-        match r {
-            Ok(()) => break Ok(()),
-            Err(e) if is_radio_error(&e) => {
-                let msg = format!("{e:#}");
-                w.insert_radio_event("disconnected", &msg)?;
-                eprintln!("{}", json!({"event": "disconnected", "error": msg}));
-                sh.status.lock().unwrap()["radio"] = json!("disconnected");
-                radio_opt = None;
-                busy_since = None;
-                backoff = Duration::from_secs(1);
-                next_try = Instant::now() + backoff;
-            }
-            Err(e) => break Err(e),
-        }
+    let lc = link::LinkConfig {
+        lora,
+        usb_serial: cfg.usb_serial.clone(),
+        duty_cycle_limit: cfg.node.duty_cycle_limit,
+        duty_cycle_enforce: cfg.node.duty_cycle_enforce,
+        stats_interval: Duration::from_secs(60),
     };
-    w.end_session()?;
+    let mut h = Mt { sh: sh.clone(), w, acked_recent: HashMap::new() };
+    let res = link::run(&lc, &mut h, &qrx, &airtime, &sh.stop).map_err(|e| anyhow!(e));
+    h.w.s.end()?;
     eprintln!("{}", json!({"event": "stopped", "error": res.as_ref().err().map(|e| format!("{e:#}"))}));
     res
-}
-
-fn transmit(radio: &mut sx1262::Sx1262, lora: &sx1262::LoraConfig, sh: &Shared, w: &Writer, job: &TxJob) -> Result<Value> {
-    let o = &job.out;
-    let airtime = lora.time_on_air_us(o.frame.len()) / 1000.0;
-    let budget = sh.cfg.node.duty_cycle_limit * 3_600_000.0;
-    let used = sh.airtime_last_hour_ms();
-    if sh.cfg.node.duty_cycle_enforce && used + airtime > budget {
-        bail!("duty cycle limit: {used:.0} ms used of {budget:.0} ms in last hour");
-    }
-    let t = store::now();
-    let r = radio.transmit(lora, &o.frame);
-    let err = r.as_ref().err().map(|e| e.to_string());
-    let fid = w.insert_tx(t, &o.frame, airtime, &o.header, o.encryption, o.portnum, &o.data_json, job.attempt, err.as_deref())?;
-    r?;
-    sh.tx_log.lock().unwrap().push_back((Instant::now(), airtime));
-    Ok(json!({"tx_frame_id": fid, "tx_time": t, "attempt": job.attempt, "len": o.frame.len(), "airtime_ms": (airtime * 10.0).round() / 10.0}))
 }
 
 /// Config with private key removed, for storage.

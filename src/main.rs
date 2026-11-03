@@ -756,7 +756,7 @@ fn run(cli: &Cli) -> Result<()> {
             let c = store::open_ro(&db_path)?;
             print(&json!(store::query_json(&c, query, &[])?));
         }
-        Cmd::Schema => println!("{}", store::SCHEMA.trim()),
+        Cmd::Schema => println!("{}", store::full_schema()),
         Cmd::Decode { hex: h } => {
             let raw = hex::decode(h.trim()).context("hex")?;
             let d = decode::decode_frame(&raw, false, &cfg.channels()?, None);
