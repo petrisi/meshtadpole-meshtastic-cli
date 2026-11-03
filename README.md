@@ -17,7 +17,7 @@ Target users: AI agents and engineers operating dense Meshtastic networks. The C
 cargo build --release      # target/release/tadpole-mt
 ```
 
-Requires `../meshtadpole-radio`. Windows: WinUSB bound to `1a86:5512` (Zadig). Linux: udev rule for `1a86:5512`.
+Requires `../meshtadpole-radio`. Windows: WinUSB bound to `1a86:5512` (Zadig). Linux: build deps `build-essential pkg-config libudev-dev`; root works as is (kernel `spi_ch341` auto-detached); non-root needs a udev rule, see meshtadpole-radio README.
 
 ## Files
 
@@ -63,7 +63,7 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 | Daemon: start without stick, reconnect, RX watchdog | working (unplug/replug tested on Windows) |
 | Fire-and-forget admin writes (`--no-wait`), passkey cache | working |
 | AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
-| Linux | untested |
+| Linux (Ubuntu 26.04.1, kernel 7.0) | working: build, tests, RX, TX, PKC, admin, reconnect |
 
 ## Node identity
 
