@@ -61,6 +61,7 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 | ACK/NAK of packets to us; NodeInfo and traceroute responders; NO_RESPONSE for others | working |
 | Bulk admin targets (lists, @groups), ignore/unignore | working |
 | Daemon: start without stick, reconnect, RX watchdog | working (unplug/replug tested on Windows) |
+| Stuck-receiver recovery (light AGC reset), radio loop watchdog (exit 70), `status.loop_age_s` | working (shared meshtadpole-radio) |
 | Fire-and-forget admin writes (`--no-wait`), passkey cache | working |
 | AEAD channels, XEdDSA signing, rebroadcasting | not implemented |
 | Linux (Ubuntu 26.04.1, kernel 7.0) | working: build, tests, RX, TX, PKC, admin, reconnect |
