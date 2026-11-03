@@ -28,6 +28,9 @@ pub struct RadioConfig {
     pub override_frequency_mhz: Option<f64>,
     pub tx_power_dbm: i8,
     pub rx_boosted_gain: bool,
+    /// Preventive receiver (AGC) reset interval in seconds; null = off (stuck detection still active).
+    #[serde(default)]
+    pub agc_reset_interval_s: Option<u64>,
 }
 
 /// Our node identity on the mesh.
@@ -111,6 +114,7 @@ impl Default for Config {
                 override_frequency_mhz: None,
                 tx_power_dbm: 14,
                 rx_boosted_gain: true,
+                agc_reset_interval_s: None,
             },
             channels: vec![ChannelConfig { name: "EdgeFastLow".into(), psk: "AQ==".into() }],
             api: DEFAULT_API.into(),

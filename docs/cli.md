@@ -172,6 +172,7 @@ All automatic replies use channel encryption, are rate-limited to one per (from,
 - CSMA: TX deferred while a preamble/header is being received; random 0–400 ms initial backoff.
 - Duty cycle: TX refused when own airtime in the last hour would exceed `node.duty_cycle_limit` (default 0.10). Disable for lab use: `config --set node.duty_cycle_enforce=false`.
 - Power: `radio.tx_power_dbm` (default 14, max 22).
+- Receiver recovery (meshtadpole-radio `link`): stuck-receiver detection with light AGC reset is always on (`rx_restored` events, detail prefix `agc_stuck:`); `radio.agc_reset_interval_s` (default null = off) adds a preventive reset at that interval, skipped while frames arrive.
 - This node never rebroadcasts. `node.role` is only advertised.
 
 ## Frame event (listen)
