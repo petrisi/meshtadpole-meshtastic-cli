@@ -51,14 +51,17 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 
 Requirements: Rust >= 1.85 (rustup), git.
 
-Dependency `meshtadpole-radio` comes from `https://github.com/petrisi/meshtadpole-radio` (currently private). For a clean clone, cargo needs git credentials: `gh auth login`, `gh auth setup-git`, and `[net] git-fetch-with-cli = true` in `~/.cargo/config.toml` (or env `CARGO_NET_GIT_FETCH_WITH_CLI=true`).
+Prebuilt binaries (Linux x86_64, Windows x86_64): GitHub Releases of this repo, built by `.github/workflows/release.yml` on a `v*` tag. Linux: `tar xzf tadpole-mt-<version>-x86_64-linux.tar.gz`, then install the binary as below (needs `libudev1`, present on desktop/server installs). Windows: unzip `tadpole-mt-<version>-x86_64-windows.zip`.
 
-Development with both repos checked out side by side: put this in `.cargo/config.toml` of the common parent directory (outside the repos) to build against the local checkout:
+Build from source: dependency `meshtadpole-radio` (MIT) is fetched by cargo from the public repo `https://github.com/petrisi/meshtadpole-radio` (revision pinned in `Cargo.lock`; `cargo update -p meshtadpole-radio` moves to its latest commit).
+
+Changing `meshtadpole-radio` together with this tool (both repos checked out side by side): build with an explicit patch, and do not commit the `Cargo.lock` it produces (it loses the git source):
 
 ```
-[patch."https://github.com/petrisi/meshtadpole-radio"]
-meshtadpole-radio = { path = "meshtadpole-radio" }
+cargo build --config 'patch."https://github.com/petrisi/meshtadpole-radio".meshtadpole-radio.path="../meshtadpole-radio"'
 ```
+
+After pushing the radio change: `cargo update -p meshtadpole-radio` and commit `Cargo.lock`. CI builds with `--locked`.
 
 Linux (tested Ubuntu 26.04, kernel 7.0):
 
