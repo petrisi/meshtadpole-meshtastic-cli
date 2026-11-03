@@ -47,6 +47,59 @@ No config file = built-in defaults (EdgeFastLow). `tadpole-mt config --write` wr
 - [docs/cli.md](docs/cli.md) — commands, output, exit codes, API.
 - [docs/schema.md](docs/schema.md) — database tables, views, semantics.
 
+## Install
+
+Requirements: Rust >= 1.85 (rustup). The repos `meshtadpole-radio` and `meshtadpole-meshtastic-cli` must be checked out side by side (path dependency until published).
+
+Linux (tested Ubuntu 26.04, kernel 7.0):
+
+```
+sudo apt install build-essential pkg-config libudev-dev
+cd meshtadpole-meshtastic-cli && cargo build --release
+sudo install -m 755 target/release/tadpole-mt /usr/local/bin/
+```
+
+USB access: root works as is (the kernel `spi_ch341` driver is detached automatically). Non-root: udev rule in the `meshtadpole-radio` README.
+
+Windows (tested Windows 10):
+
+```
+cd meshtadpole-meshtastic-cli
+cargo build --release
+mkdir %LOCALAPPDATA%\Programs\meshtadpole
+copy target\release\tadpole-mt.exe %LOCALAPPDATA%\Programs\meshtadpole\
+```
+
+Add that directory to PATH. The stick needs the WinUSB driver (Zadig, device `1a86:5512`); the vendor CH341PAR driver is not used.
+
+Then: `tadpole-mt config --write`, edit or `--set` the config, start `tadpole-mt daemon` (see "Running as a service").
+
+## Running as a service
+
+The daemon reconnects to the stick on its own (backoff 1-30 s) and starts without it. It exits on database errors and when the radio loop is blocked for 120 s (`radio_events` `stalled`, exit code 70); run it under a service manager that restarts it.
+
+Linux (systemd), `/etc/systemd/system/tadpole-mt.service`:
+
+```
+[Unit]
+Description=Meshtastic node (tadpole-mt)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/tadpole-mt daemon
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Non-root: add the udev rule from `meshtadpole-radio` README and set `User=`. Config/DB then live in that user's `~/.local/share/meshtadpole/`.
+
+Windows: Task Scheduler task "At startup", action `tadpole-mt.exe daemon`, settings "If the task fails, restart every 1 minute"; or a service wrapper (e.g. NSSM).
+
+
 ## Status
 
 | Feature | State |
