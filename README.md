@@ -2,7 +2,7 @@
 
 Host-side Meshtastic-compatible node for the MeshTadpole SX1262 USB stick. Binary: `tadpole-mt`. Windows, Linux.
 
-Target users: AI agents and engineers operating dense Meshtastic networks. The CLI is an interface to the mesh and to the record of everything heard; analysis is done by the caller.
+Target users: AI agents and engineers operating Meshtastic networks. The CLI is an interface to the mesh and to the record of everything heard; analysis is done by the caller.
 
 ## Architecture
 
