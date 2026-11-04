@@ -1,6 +1,6 @@
 # meshtadpole-meshtastic-cli
 
-Host-side Meshtastic node for the MeshTadpole SX1262 USB stick. Binary: `tadpole-mt`. Windows, Linux.
+Host-side Meshtastic-compatible node for the MeshTadpole SX1262 USB stick. Binary: `tadpole-mt`. Windows, Linux.
 
 Target users: AI agents and engineers operating dense Meshtastic networks. The CLI is an interface to the mesh and to the record of everything heard; analysis is done by the caller.
 
@@ -94,7 +94,7 @@ Linux (systemd), `/etc/systemd/system/tadpole-mt.service`:
 
 ```
 [Unit]
-Description=Meshtastic node (tadpole-mt)
+Description=Meshtastic-compatible node (tadpole-mt)
 After=network.target
 
 [Service]
@@ -142,3 +142,9 @@ Top-level `redact_fields`: payload field names masked in DB and output (default 
 ## License
 
 GPL-3.0-only. Derived from Meshtastic firmware and protobufs (GPL-3.0).
+
+## Trademark
+
+Meshtastic is a trademark of Meshtastic LLC. This is an independent project, not affiliated with,
+endorsed by, or sponsored by Meshtastic LLC or the Meshtastic project. The name is used only to
+describe compatibility with the Meshtastic protocol.
