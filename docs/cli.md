@@ -191,6 +191,7 @@ All automatic replies use channel encryption, are rate-limited to one per (from,
 - `hops_taken` = `hop_start - hop_limit`; null if sender did not set `hop_start`.
 - `relay_node` / `next_hop`: last byte of the relaying / intended next-hop node number (0 = none).
 - `dup_of`: frame id of the first reception of the same (`from`,`id`) within 1 h; null for first reception.
+- `pkc_key` (PKC frames that decrypted, `channel` = `PKC`): base64 public key the frame was decrypted with. It proves which key sent the frame; the key the node table holds for `from` can change later (any NodeInfo replaces it), so check senders against `pkc_key`, not against `nodes.public_key`.
 - `header_error` events carry only `frame_id`, `rx_time`, `status`, `rssi` (instantaneous).
 
 ## Daemon resilience

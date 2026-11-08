@@ -38,11 +38,14 @@ pub struct Decoded {
     #[serde(skip)]
     pub plaintext: Option<Vec<u8>>,
     pub error: Option<String>,
+    /// PKC frames that decrypted: base64 public key of the peer that the frame was decrypted with. The key held for a
+    /// node can change (NodeInfo), so this is the proof of who sent the frame, not the node table.
+    pub pkc_key: Option<String>,
 }
 
 impl Decoded {
     fn bare(status: Status, header: Option<Header>) -> Decoded {
-        Decoded { status, header, channel: None, portnum: None, port: None, data: None, plaintext: None, error: None }
+        Decoded { status, header, channel: None, portnum: None, port: None, data: None, plaintext: None, error: None, pkc_key: None }
     }
 }
 
@@ -167,6 +170,7 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
                             data: Some(data),
                             plaintext: Some(plain),
                             error: None,
+                            pkc_key: Some(base64::engine::general_purpose::STANDARD.encode(pk)),
                         };
                     }
                     Err(e) => {
@@ -198,6 +202,7 @@ pub fn decode_frame(raw: &[u8], crc_error: bool, channels: &[Channel], pkc: Opti
                     data: Some(data),
                     plaintext: Some(buf),
                     error: None,
+                    pkc_key: None,
                 };
             }
             Err(e) => last_err = Some(format!("{e:#}")),
@@ -243,6 +248,9 @@ pub fn to_json(d: &Decoded) -> Value {
     if let Some(e) = &d.error {
         o.insert("error".into(), json!(e));
     }
+    if let Some(k) = &d.pkc_key {
+        o.insert("pkc_key".into(), json!(k));
+    }
     v
 }
 
@@ -260,5 +268,51 @@ mod tests {
         assert_eq!(s["security"]["public_key"], "PUB");
         assert_eq!(s["network"]["wifi_psk"], "<redacted>");
         assert_eq!(s["network"]["wifi_ssid"], "S");
+    }
+
+    /// PKC text from `peer` to `me`, encrypted with `sender`'s key.
+    fn pkc_frame(me: u32, peer: u32, sender: &crate::pkc::Identity, me_public: &[u8; 32]) -> Vec<u8> {
+        let h = Header {
+            to: me,
+            from: peer,
+            id: 7,
+            hop_limit: 3,
+            want_ack: false,
+            via_mqtt: false,
+            hop_start: 3,
+            channel_hash: 0,
+            next_hop: 0,
+            relay_node: 0,
+        };
+        let plain = [0x08, 0x01, 0x12, 0x02, b'h', b'i']; // Data{portnum: TEXT_MESSAGE_APP, payload: "hi"}
+        let mut f = h.encode().to_vec();
+        f.extend(crate::pkc::encrypt(&sender.shared(me_public), peer, 7, &plain, 0x11223344).unwrap());
+        f
+    }
+
+    #[test]
+    fn pkc_key_is_the_decrypting_key() {
+        let b64 = |b: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(b);
+        let me = crate::pkc::Identity::from_b64(&b64([1u8; 32])).unwrap();
+        let peer = crate::pkc::Identity::from_b64(&b64([2u8; 32])).unwrap();
+        let other = crate::pkc::Identity::from_b64(&b64([3u8; 32])).unwrap();
+        let (me_n, peer_n) = (0x0000_0001, 0x0000_0002);
+        let ctx = |k: [u8; 32]| PkcCtx { me: me_n, id: me.clone(), keys: [(peer_n, k)].into_iter().collect() };
+
+        let d = decode_frame(&pkc_frame(me_n, peer_n, &peer, &me.public), false, &[], Some(&ctx(peer.public)));
+        assert_eq!(d.status, Status::Ok);
+        assert_eq!(d.channel.as_deref(), Some("PKC"));
+        assert_eq!(d.pkc_key.as_deref(), Some(b64(peer.public).as_str()));
+        assert_eq!(to_json(&d)["pkc_key"], b64(peer.public));
+
+        // another key under the same node number (e.g. a NodeInfo replaced it): the frame names that key
+        let d = decode_frame(&pkc_frame(me_n, peer_n, &other, &me.public), false, &[], Some(&ctx(other.public)));
+        assert_eq!(d.status, Status::Ok);
+        assert_eq!(d.pkc_key.as_deref(), Some(b64(other.public).as_str()));
+
+        // held key does not match the sender's: not decrypted, no key
+        let d = decode_frame(&pkc_frame(me_n, peer_n, &other, &me.public), false, &[], Some(&ctx(peer.public)));
+        assert_eq!(d.status, Status::DecodeError);
+        assert!(d.pkc_key.is_none() && to_json(&d).get("pkc_key").is_none());
     }
 }
