@@ -419,10 +419,19 @@ fn admin_one(cfg: &Config, db_path: &std::path::Path, to: u32, op: &AdminOp, w: 
     Ok(json!({"node": packet::node_id(to), "results": results}))
 }
 
+/// Our public key (base64): derived from `node.private_key`, or, in a config without it (a client config that
+/// leaves the secret to the daemon), the running daemon's.
+fn own_public_b64(cfg: &Config) -> Result<Option<String>> {
+    if let Some(k) = cfg.node.private_key.as_deref() {
+        return Ok(Some(pkc::Identity::from_b64(k)?.public_b64()));
+    }
+    Ok(daemon::call(&cfg.api, &json!({"cmd": "status"})).ok().and_then(|s| s["public_key"].as_str().map(str::to_string)))
+}
+
 /// Send our NodeInfo to `to` over the channel, requesting theirs.
 fn nodeinfo_exchange(cfg: &Config, to: u32, w: WaitOpts) -> Result<Value> {
     let me = cfg.node.num.ok_or_else(|| anyhow!("node.num not set"))?;
-    let pubk = cfg.node.private_key.as_deref().map(pkc::Identity::from_b64).transpose()?.map(|i| i.public_b64());
+    let pubk = own_public_b64(cfg)?;
     let payload = mesh::user_payload(cfg, me, pubk)?;
     daemon::call(&cfg.api, &send_req(to, "NODEINFO_APP", &payload, false, true, Some(false), 0, w))
 }
@@ -649,12 +658,13 @@ fn run(cli: &Cli) -> Result<()> {
             }));
         }
         Cmd::Identity => {
-            let id = cfg.node.private_key.as_deref().map(pkc::Identity::from_b64).transpose()?;
+            let public_key = own_public_b64(&cfg)?;
             print(&json!({
                 "num": cfg.node.num, "id": cfg.node.num.map(packet::node_id),
                 "long_name": cfg.node.long_name, "short_name": cfg.node.short_name,
                 "role": cfg.node.role, "hw_model": cfg.node.hw_model, "hop_limit": cfg.node.hop_limit,
-                "public_key": id.map(|i| i.public_b64()),
+                "public_key": public_key,
+                "private_key_in_config": cfg.node.private_key.is_some(),
             }));
         }
         Cmd::Send { to, text, channel, no_pkc, no_ack, w } => {

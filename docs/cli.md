@@ -20,7 +20,7 @@ Output: JSON (pretty) or NDJSON on stdout. Errors: `{"error":"<message>"}` on st
 |---|---|---|
 | `devices` | — | array: bus, address, vid, pid, product, serial, device_id, open_error |
 | `config [--write] [--set PATH=VALUE]...` | — | effective config (private key redacted), derived LoRa parameters (freq_hz, bw_hz, sf, cr, sync_word, ldro, channel hashes), paths. `--set` writes the file; value parsed as JSON else string; `node.num` accepts node ids. Restart daemon to apply |
-| `identity` | — | our node num/id, names, role, public key derived from `node.private_key` |
+| `identity` | — | our node num/id, names, role, public key derived from `node.private_key` (without it in the config: the running daemon's), `private_key_in_config` |
 | `send <TO> <TEXT> [--channel N] [--no-pkc] [--no-ack]` | daemon | send result (below). Unicast uses PKC when the destination key is known |
 | `request <TO> <KIND>` | daemon | request result (see Requests) |
 | `nodeinfo <TO>` | daemon | send our User (incl. public key) over the channel with want_response |
